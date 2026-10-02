@@ -2678,7 +2678,7 @@ static void handleCommand(const String& line) {
                 s_gasHist = GasHistory{};
                 gasHistorySave();
                 saveCfg();
-                Serial.println("gas cal + log reset to stock (F=1009 E=25014) - now press SET FULL at a full tank, SET EMPTY at empty");
+                Serial.println("gas cal + history reset to stock (F=1009 E=25014) - now press SET FULL at a full tank, SET EMPTY at empty");
                 break;
             }
             if (val == "F" || val == "E" || val == "1" || val == "2" || val == "3") {
