@@ -484,7 +484,6 @@ static uint16_t s_warnLatched = 0;   // forward decl (real def below)
 static volatile float s_speedMph = 0; // ABS speed, mph (0xB0 f[2])
 static void gasSampleMv();     // ADC read + EMA advance; ONCE per loop()
 static int  gasPctFromFilt();  // pure s_gasFilt -> percent mapping
-static void gasAutoCal();
 static void saveCfg();
 
 static uint32_t s_rxA0Count = 0;
@@ -1305,24 +1304,12 @@ static void updateDisplay() {
 }
 
 static int16_t s_gasFilt = -1;   // damped reported-mV, -1 = uninitialised
-// The HIGHEST/LOWEST percentage observed under the CURRENT table since it last
-// moved, and the mV that produced it. These are the auto-cal gates (see
-// gasLogUpdate); deliberately NOT the lifetime log extremes.
-// The pct is kept because "most extreme" is a property of the pct, not of the
-// sample order — recording the LAST sample that happened to cross 95% would let a
-// sender bouncing 95/99/97/96 commit 96 and re-linearise the whole tank curve off
-// a noise-contaminated endpoint. -1 / 101 are outside [0,100] so the first real
-// sample always wins.
-static int8_t   s_fullPctSinceCal  = -1;
-static int16_t  s_fullMvSinceCal   = -1;
-static int8_t   s_emptyPctSinceCal = 101;
-static int16_t  s_emptyMvSinceCal  = -1;
 
 /* The ONLY function that reads the ADC and advances the EMA. Called exactly
  * once per loop() iteration, from loop(), before any consumer runs.
  *
  * This used to be the first half of gasPercent(), which was called from six
- * places (0xB0 frame, low-fuel buzzer test, gas log, gas display, and two
+ * places (0xB0 frame, low-fuel buzzer test, gas history, gas display, and two
  * Serial status prints) each of which also advanced the filter. So the damping
  * a caller got depended on how many OTHER callers happened to run first in the
  * same iteration — gasDamp was a per-call divisor, not a time constant, and the
@@ -1345,7 +1332,7 @@ static void gasSampleMv() {
  * No ADC read, no side effect. Safe to call any number of times from anywhere.
  * Takes the mV explicitly rather than reading s_gasFilt, so it can also re-score
  * an already-recorded mV against a table that has since changed (see
- * gasLogRescore). */
+ * gasHistoryRescore). */
 /* WHICH TABLE DOES THE NEEDLE ACTUALLY MAP WITH?
  *
  * The stuck-at-full poison guard (2026-09-20): a SET F pressed while the sender
@@ -1355,25 +1342,28 @@ static void gasSampleMv() {
  * zero-span tables map against the stock span instead, and the gauge keeps
  * moving until a clean SET F/E.
  *
- * The guard lived inline in gasPctFromMv(), which made the mapping table a
- * secret of one function. gasAutoCal() then ran its slope test straight off
- * g_cfg.gasCalMv and so read the REJECTED values - a repair path reasoning
- * about a table the needle is not using. On {F=60000, E=25014} it read
- * "inverted" (60000 > 25014), so `better` demanded fMv > 60000 and a real
- * 1009 mV full-tank reading could never move the FULL anchor: the 2026-09-20
- * failure again, now permanent instead of transient. The EMPTY anchor could
- * still commit - in the WRONG direction, `better` now being fMv < 25014, so the
- * first full-tank reading was written into it - and the re-linearisation then
- * ran the inverted branch and interpolated the mids between 60000 and ~1009,
- * putting every one of them above the FULL anchor. Simulated end state
- * {60000, 15756, 30504, 45252, 1009}: still rejected, so still mapping with
- * stock, and now with the EMPTY anchor destroyed too. Strictly worse than the
- * state it started in, and reachable by simply driving the tank.
+ * The guard used to live inline in gasPctFromMv(), which made the mapping table
+ * a secret of one function. gasAutoCal() then ran its slope test straight off
+ * g_cfg.gasCalMv, so it reasoned about a table the needle was NOT using: on
+ * {F=60000, E=25014} it read "inverted" (60000 > 25014), demanded fMv > 60000,
+ * and a real 1009 mV full-tank reading could never move the FULL anchor - the
+ * 2026-09-20 failure again, now permanent instead of transient. Its EMPTY anchor
+ * still committed, in the WRONG direction, and the re-taper then ran the
+ * inverted branch and put every mid above the FULL anchor. Reachable by simply
+ * driving the tank.
  *
  * Single source of truth now. Writes the 5 anchors the gauge really uses into
  * c[] and returns true if the persisted table was REJECTED (c[] then holds
  * kGasStockMv). Callers must take their slope direction from c[], never from
- * g_cfg.gasCalMv. */
+ * g_cfg.gasCalMv.
+ *
+ * There is no second reader any more. gasAutoCal() is gone (removed 2026-10-02;
+ * the owner knows when the tank is empty and when it is full, so `Q F` / `Q E`
+ * are the only writers of an anchor), and it refused raw < 1000 or >= 30000 -
+ * the same limits as this guard. So a rejected table can now only come from a
+ * corrupt NVS blob or pre-2026-09-20 firmware, and `Q R` clears it. There is
+ * deliberately NO self-repair path: the repair that existed was itself the
+ * defect, and with no auto-cal there is nothing left to re-introduce it. */
 static bool gasCalMapTable(uint16_t c[5]) {
     const uint16_t *src = g_cfg.gasCalMv;
     bool poisoned = (src[0] >= 30000 || src[4] >= 30000 ||   // open-sender clamp
@@ -1383,38 +1373,6 @@ static bool gasCalMapTable(uint16_t c[5]) {
     for (uint8_t i = 0; i < 5; i++) c[i] = src[i];
     return poisoned;
 }
-
-/* The per-anchor half of the guard above: is this ONE anchor inside the
- * sender's live window at all? Deliberately the same 1000/30000 limits, so
- * gasAutoCal()'s repair escape fires on exactly the tables the guard rejects
- * and on no others. (auto-cal's own GAS_CAL_VALID_LO is 900, looser on purpose
- * so the FULL anchor's 50 mV hysteresis band has room at stock 1009; that
- * looseness belongs to the hysteresis test, not to "is this a tank reading".) */
-static bool gasAnchorSane(int32_t mv) {
-    return mv > 1000 && mv < 30000;
-}
-
-/* WHICH MID ANCHORS ARE IN EFFECT: the operator's / factory's curve, or a
- * straight taper?
- *
- * Provenance is INFERRED from the numbers, not stored. gasRelinMids() always
- * writes the exact straight taper between the current endpoints, so any mid
- * that is not that taper carries knowledge the taper cannot reproduce: either a
- * `Q 1/2/3` refinement taken at a fuel level the operator could see, or the
- * factory curve itself - kGasStockMv's mids are 4800/9800/16418 and are NOT the
- * taper of its own 1009..25014 endpoints (that is 7010/13011/19012). One test
- * separates the two cases exactly.
- *
- * A stored flag would be cleaner state and is not an option: loadCfg() rejects
- * any blob whose length != sizeof(g_cfg), so one added bit in struct Cfg wipes
- * the pin map, the engine profile and the calibration on every box in the field.
- * Inferring it also keeps `Q R` a pure data restore - it has no flag to clear.
- *
- * (This inference was added alongside a CAL / CAL* badge that displayed it. The
- * badge was removed at the owner's request - they know when the tank is empty and
- * full, which is the fact the calibration depends on, and did not need telling
- * which shape the mid anchors had. The behaviour it reported is preserved either
- * way; the badge was only ever a report of it.) */
 
 static int gasPctFromMv(int16_t mv) {
     uint16_t c[5];
@@ -1458,74 +1416,84 @@ static int gasPctFromMv(int16_t mv) {
 
 static inline int gasPctFromFilt() { return gasPctFromMv(s_gasFilt); }
 
-// Min/Max tank-float log: lowest & highest readings ever seen, in BOTH
-// damped mv and the resulting %. Lives under its OWN NVS key ("gaslog") so
-// adding/changing it can never resize the main "cfg" blob (whose sizeof/
-// magic guard would silently wipe the calibrated gasCalMv table). Fully
-// automatic — self-seeds from the first plausible reading, records extremes
-// forever, never wiped. Empty reference = g_cfg.gasCalMv[4] (SET E), untouched.
-static constexpr uint8_t GASLOG_MAGIC = 0x4C;
-struct GasLog {
-    uint8_t  magic  = GASLOG_MAGIC;
+/* FUEL-USAGE HISTORY: the lowest and highest fuel levels this tank has been
+ * driven to since the box was fitted, in BOTH damped mV and the resulting %.
+ * This is what draws the yellow history band on the gauge ring, and it is the
+ * ONLY thing that remains of the old auto-calibration feature.
+ *
+ * It has nothing to do with calibration. `Q F` / `Q E` set the anchors (the
+ * owner knows when the tank is empty and when it is full) and `Q F`/`Q E` also
+ * fill the three mids as quarter points of the straight line between them.
+ * Nothing rewrites an anchor on its own.
+ *
+ * NVS: its OWN key, still the literal "gaslog" so every box in the field keeps
+ * the band it already accumulated - renaming the key would orphan the blob and
+ * silently reset everyone's history to empty. It is deliberately NOT in the
+ * main "cfg" blob, whose sizeof/magic guard would wipe the calibrated
+ * gasCalMv table if this struct ever changed size.
+ *
+ * Self-seeds from the first plausible reading, records extremes forever, never
+ * wiped. Empty reference = g_cfg.gasCalMv[4] (SET E), untouched. */
+static constexpr uint8_t GASHIST_MAGIC = 0x4C;
+struct GasHistory {
+    uint8_t  magic  = GASHIST_MAGIC;
     int8_t   minPct = -1;   // -1 = unseeded
     int8_t   maxPct = -1;
     int16_t  minMv  = -1;
     int16_t  maxMv  = -1;
 };
-static GasLog s_gasLog;
+static GasHistory s_gasHist;
 
-static void gasLogSave() {
-    g_prefs.putBytes("gaslog", &s_gasLog, sizeof(s_gasLog));
+static void gasHistorySave() {
+    g_prefs.putBytes("gaslog", &s_gasHist, sizeof(s_gasHist));
 }
 
-static void gasLogLoad() {
-    size_t len = g_prefs.getBytes("gaslog", &s_gasLog, sizeof(s_gasLog));
-    if (len != sizeof(s_gasLog) || s_gasLog.magic != GASLOG_MAGIC) {
-        s_gasLog = GasLog{};   // unseeded; first plausible read owns min=max
+static void gasHistoryLoad() {
+    size_t len = g_prefs.getBytes("gaslog", &s_gasHist, sizeof(s_gasHist));
+    if (len != sizeof(s_gasHist) || s_gasHist.magic != GASHIST_MAGIC) {
+        s_gasHist = GasHistory{};   // unseeded; first plausible read owns min=max
     }
 }
 
-/* Re-derive the logged PERCENTAGES from the logged mV against the CURRENT
+/* Re-derive the stored PERCENTAGES from the stored mV against the CURRENT
  * calibration.
  *
  * minMv/maxMv are calibration-independent — they are physical sender voltages.
  * minPct/maxPct are not: they are what the table in force at the time said.
- * gasAutoCal() and `Q F/E/1/2/3` move that table, which silently invalidated
- * every percentage already in the log, so recompute them from the recorded mV
- * (which are physical and table-independent).
+ * `Q F/E/1/2/3` moves that table, which silently invalidates every percentage
+ * already stored, so recompute them from the recorded mV (which are physical
+ * and table-independent).
  *
- * These percentages are DISPLAY ONLY. The auto-commit gates used to read them,
- * which meant a log recorded against a stretched table could report maxPct 95
- * that the new table would never produce. That is now handled separately: the
- * gates use s_fullMvSinceCal / s_emptyMvSinceCal, which only record observations
- * made under the CURRENT table, and are cleared whenever it changes.
+ * These percentages are DISPLAY ONLY. Nothing consumes them as a decision
+ * input any more — the auto-cal gates that used to read them are gone, which
+ * also retires the old failure where a log recorded against a stretched table
+ * reported maxPct 95 that the current table would never produce.
  *
  * Returns true if anything changed, so the caller can decide to persist. */
-static bool gasLogRescore() {
-    if (s_gasLog.minPct < 0) return false;   // unseeded; nothing to re-score
-    if (s_gasLog.minMv < 0 || s_gasLog.maxMv < 0) return false;
-    int loPct = constrain(gasPctFromMv(s_gasLog.maxMv), 0, 100);  // low  mV
-    int hiPct = constrain(gasPctFromMv(s_gasLog.minMv), 0, 100);  // high mV
+static bool gasHistoryRescore() {
+    if (s_gasHist.minPct < 0) return false;   // unseeded; nothing to re-score
+    if (s_gasHist.minMv < 0 || s_gasHist.maxMv < 0) return false;
+    int loPct = constrain(gasPctFromMv(s_gasHist.maxMv), 0, 100);  // low  mV
+    int hiPct = constrain(gasPctFromMv(s_gasHist.minMv), 0, 100);  // high mV
     // mV and % run opposite ways on a normal sender, so don't assume an order.
     if (loPct > hiPct) { int t = loPct; loPct = hiPct; hiPct = t; }
-    if (loPct == s_gasLog.minPct && hiPct == s_gasLog.maxPct) return false;
-    s_gasLog.minPct = (int8_t)loPct;
-    s_gasLog.maxPct = (int8_t)hiPct;
+    if (loPct == s_gasHist.minPct && hiPct == s_gasHist.maxPct) return false;
+    s_gasHist.minPct = (int8_t)loPct;
+    s_gasHist.maxPct = (int8_t)hiPct;
     return true;
 }
 
-static void gasLogUpdate() {
+static void gasHistoryUpdate() {
     // Both values must come from the SAME sample. Historically gasPercent() was
     // a write function — it advanced the EMA and assigned s_gasFilt as a side
     // effect — so reading `mv = s_gasFilt` BEFORE calling it yielded the previous
     // sample's mV alongside this sample's percent. On a momentary sender dropout
     // (connector bounce, ignition blip) the node railed, pct became 0, and the
     // stale-but-valid mid-tank mv sailed through the plausibility gate below.
-    // minPct was then latched to 0 permanently in NVS, which also unlocked
-    // gasAutoCal()'s EMPTY-anchor rewrite (gated on minPct <= 5) against a
-    // mid-tank mV. 'Q R' was the only way to clear it.
+    // minPct was then latched to 0 permanently in NVS, so the band on the gauge
+    // claimed an empty tank it had never seen. 'Q R' was the only way to clear it.
     //
-    // Now guaranteed rather than merely ordered: gasLogUpdate() reads the SAME
+    // Now guaranteed rather than merely ordered: gasHistoryUpdate() reads the SAME
     // s_gasFilt that gasPctFromFilt() maps, and gasSampleMv() ran once at the
     // top of this loop() iteration, so the two can no longer disagree.
     int pct = gasPctFromFilt();
@@ -1535,282 +1503,20 @@ static void gasLogUpdate() {
     // is a real tank level. Only log inside the sender's live window.
     if (mv < 1000 || mv >= 32000) return;
     if (pct < 0 || pct > 100) return;
-    // Track the extremes observed under the CURRENT table, BEFORE the
-    // first-boot seeding branch below — that branch returns early, so anything
-    // written after it is skipped on exactly the sample that first populates the
-    // log. Putting it here also means the seed observation counts as an
-    // observation: on a first boot / after `Q R` / after `P WIPE` with the tank
-    // already near full, the >=95% reading must arm the FULL gate, or the gate
-    // stays disarmed until the tank returns to full a second time.
-    if (pct > s_fullPctSinceCal)  { s_fullPctSinceCal  = (int8_t)pct; s_fullMvSinceCal  = (int16_t)mv; }
-    if (pct < s_emptyPctSinceCal) { s_emptyPctSinceCal = (int8_t)pct; s_emptyMvSinceCal = (int16_t)mv; }
-    if (s_gasLog.minPct < 0) {
-        s_gasLog.minPct = s_gasLog.maxPct = (int8_t)pct;
-        s_gasLog.minMv  = s_gasLog.maxMv  = (int16_t)mv;
-        gasLogSave();
+    // The first plausible reading owns min=max and returns, so the four update
+    // lines below are skipped on exactly the sample that populates the log.
+    if (s_gasHist.minPct < 0) {
+        s_gasHist.minPct = s_gasHist.maxPct = (int8_t)pct;
+        s_gasHist.minMv  = s_gasHist.maxMv  = (int16_t)mv;
+        gasHistorySave();
         return;
     }
     bool changed = false;
-    if (pct < s_gasLog.minPct) { s_gasLog.minPct = (int8_t)pct; changed = true; }
-    if (pct > s_gasLog.maxPct) { s_gasLog.maxPct = (int8_t)pct; changed = true; }
-    if (mv  < s_gasLog.minMv)  { s_gasLog.minMv  = (int16_t)mv; changed = true; }
-    if (mv  > s_gasLog.maxMv)  { s_gasLog.maxMv  = (int16_t)mv; changed = true; }
-    // Track the extremes observed under the CURRENT table. These are the only
-    // inputs to the auto-commit gates — deliberately NOT lifetime minPct/maxPct,
-    // which gasLogRescore() recomputes from the current table and which
-    // therefore describe the CURRENT mapping of a historical voltage rather than
-    // a fresh observation.
-    if (pct > s_fullPctSinceCal)  { s_fullPctSinceCal  = (int8_t)pct; s_fullMvSinceCal  = (int16_t)mv; }
-    if (pct < s_emptyPctSinceCal) { s_emptyPctSinceCal = (int8_t)pct; s_emptyMvSinceCal = (int16_t)mv; }
-    if (changed) gasLogSave();
-
-    gasAutoCal();
-}
-
-/* Fill the three mid anchors between the CURRENT FULL/EMPTY pair.
- *
- * keepExplicit: the stored mids are a `Q 1/2/3` refinement or the factory curve,
- * and only the slots that still fit monotonically
- * between the new endpoints are kept. false when the endpoint that moved was
- * itself off-scale, i.e. the mids were interpolated from a table that is not a
- * tank calibration and there is nothing to salvage.
- *
- * The taper is computed from the SORTED anchor pair, which makes it
- * bit-identical to the two branches it replaces for both slopes (ascending
- * through the slots when FULL is the low anchor, descending when it is the high
- * one) - checked equal on {1009, 25014} and {25014, 1009} - while collapsing
- * them into one loop that is allowed to decline to write. */
-static void gasRelinMids(bool keepExplicit) {
-    int32_t a = g_cfg.gasCalMv[0];        // FULL
-    int32_t b = g_cfg.gasCalMv[4];        // EMPTY
-    if (a == b) return;   // zero span: nothing to interpolate between, and
-                          // gasCalMapTable() rejects the table anyway. The old
-                          // two-branch form fell through here too and wrote
-                          // nothing, so this is not a behaviour change.
-    int32_t dir = (a < b) ? 1 : -1;        // +1 = ascending through the slots
-    int32_t lo  = dir > 0 ? a : b;
-    int32_t hi  = dir > 0 ? b : a;
-    uint8_t kept = 0;
-    bool changed = false;
-    for (uint8_t j = 1; j < 4; j++) {
-        int32_t taper = lo + (int32_t)((uint32_t)(hi - lo) * j) / 4;
-        int32_t have  = g_cfg.gasCalMv[j];
-        if (have != taper) changed = true;
-        if (keepExplicit && have != taper) {
-            /* Walked in slot order so the neighbours are already resolved. A mid
-             * that no longer fits between them would hand gasPctFromMv a
-             * non-monotonic segment list, and it does not detect that - it just
-             * returns a wrong percentage with nothing on the console to say so. */
-            int32_t prev = (j == 1) ? a : g_cfg.gasCalMv[j - 1];
-            int32_t next = (j == 3) ? b : g_cfg.gasCalMv[j + 1];
-            if (dir * (have - prev) > 0 && dir * (next - have) > 0) { kept++; continue; }
-        }
-        g_cfg.gasCalMv[j] = (uint16_t)taper;
-    }
-    if (kept == 3)
-        Serial.println("gas auto-cal: mids KEPT (operator/factory curve still fits)");
-    else if (kept)
-        Serial.printf("gas auto-cal: %u of 3 mids kept, the rest re-tapered\n", kept);
-    else if (changed)
-        Serial.println("gas auto-cal: mids re-tapered (straight taper)");
-    // Silent when the mids already were the taper: rewriting three identical
-    // values is not an event.
-}
-
-// Auto-calibrate the E/F anchors from the float's REAL extremes recorded in
-// the tank log: once the float has actually reached near-full and near-empty,
-// commit those measured mV as the FULL/EMPTY anchors and re-linearise the
-// mids (same math as Q F/E). No manual steps — just drive the tank to both
-// ends once. Slope-aware: with a NORMAL sender (low mV = full) FULL anchors at
-// the lowest logged mV; with an INVERTED sender (high mV = full) FULL anchors
-// at the highest logged mV — matched to whatever the manual anchors say.
-// Off-scale gate MUST match gasPercent poison + Q F/E rejection (>=30000 ||
-// <1000): real senders (~11-24k reported) never live above 30k, so a
-// floating/unplugged extreme can't be auto-committed as an anchor.
-static void gasAutoCal() {
-    // Gate on observations made under the CURRENT table, not on the lifetime
-    // log extremes. minPct/maxPct are recomputed by gasLogRescore() whenever the
-    // table moves, so after `Q E 18000` the log's maxPct could read 100 purely
-    // because the NEW table maps an old mid-tank voltage below the new EMPTY
-    // anchor — and auto-cal would then immediately overwrite the anchor the
-    // operator just typed, from a tank that had not moved. Requiring a fresh
-    // <=5% / >=95% observation under the current table fixes that whole class,
-    // not just the manual-anchor case.
-    if (s_gasLog.minPct < 0) return;              // log not seeded yet
-    bool dirty = false, relin = false;
-    /* Slope direction MUST come from the table the needle maps with, not from
-     * the persisted one. gasPctFromMv() rejects an off-scale / zero-span table
-     * and substitutes the stock span, so on a rejected table the readings that
-     * armed the >=95% / <=5% gates above were scored against STOCK - and stock
-     * is not inverted (1009 < 25014). Reading the rejected values instead made
-     * `inverted` true on e.g. {F=60000, E=25014}, which demanded fMv > 60000 and
-     * made the FULL anchor un-committable for good: no real reading is ever
-     * above 60000, so no full-tank drive could ever repair it. Same failure
-     * shape as the 2026-09-20 stuck-at-full bug, except the guard now hides it.
-     *
-     * The gates themselves are fine and are deliberately NOT touched: they are
-     * scored against the effective table, so a genuine end-of-scale reading
-     * always arms them whether or not the table is rejected. Only the direction
-     * test was reading the wrong table. */
-    uint16_t cal[5];
-    gasCalMapTable(cal);
-    bool inverted = cal[0] > cal[4];
-    // Gate on the EXTREME pct seen, and commit that pct's own mV. Testing only
-    // the mV would admit a reading that never reached 95%; testing the LAST
-    // crossing instead of the highest would commit whichever sample happened to
-    // come last and re-linearise the whole tank curve from a jittered endpoint.
-    int32_t fMv = (s_fullPctSinceCal  >= 95) ? s_fullMvSinceCal  : -1;
-    int32_t eMv = (s_emptyPctSinceCal <= 5)  ? s_emptyMvSinceCal : -1;
-
-    /* Hysteresis on the anchors, in the direction that makes them MORE extreme.
-     *
-     * The band exists so a jittery sample cannot ratchet an anchor, and it must
-     * stay directional - moving the FULL anchor less-full would leave the gauge
-     * reading high forever.
-     *
-     * It used to be an unconditional 50 mV step, and that made the FULL anchor
-     * mathematically un-committable out of the box. Stock kGasStockMv[0] is
-     * 1009; the validity floor is fMv > 1000. So the improving direction (lower
-     * mV) had 9 mV of valid headroom while the guard demanded a 50 mV step: the
-     * acceptable window was the EMPTY SET. On a stock install, or after any `Q R`
-     * reset, the FULL anchor could never be auto-calibrated - no matter how many
-     * full-tank observations accumulated - and it failed silently, because the
-     * branch simply never ran and printed nothing. EMPTY had the mirror problem
-     * once its anchor approached the 30000 ceiling.
-     *
-     * So: keep the band where it fits, and fall back to "valid and strictly
-     * better" where it does not. The >=95% / <=5% gate above has already thrown
-     * away samples that were not convincingly at the end of the scale, so a
-     * small step in the right direction is safe. */
-    constexpr int32_t GAS_CAL_BAND_MV  = 50;
-    /* 900, not 1000, and that is load-bearing.
-     *
-     * The first version of this fix kept the floor at 1000 and, because the
-     * stock FULL anchor is 1009, the 50 mV band needed 959 - which is outside
-     * the valid range, so the band was switched OFF for exactly the case the
-     * fix exists for and the anchor became un-committable. The obvious repair
-     * was to accept "valid and strictly better" when the band did not fit, and
-     * that is what 2f086c1 shipped.
-     *
-     * It does ratchet. A single 1 mV dip satisfies "strictly better", so the
-     * anchor walks 1009 -> 1001 in eight commits and then stops at the floor,
-     * after which a genuinely full tank reads 99% instead of 100%. Observed on
-     * the bench: pts[F,...] = 1001 where stock is 1009. The >=95% gate does not
-     * prevent it - that gate is about the tank being full, not about the
-     * reading being steady.
-     *
-     * So the band stays ON, and the floor moves instead. 900 leaves 959 inside
-     * the range, so a jitter dip no longer commits and a real 50 mV+ improvement
-     * does. The EMPTY side was never affected (band 25064 < 30000), which is
-     * why the relaxation was asymmetric and asymmetric in the direction that
-     * degrades the reading. With this floor both directions enforce the band.
-     *
-     * 900 is also consistent with the manual `Q F`/`Q E` rejection, which
-     * refuses raw < 1000 as an off-scale short. */
-    constexpr int32_t GAS_CAL_VALID_LO = 900;
-    constexpr int32_t GAS_CAL_VALID_HI = 30000;
-
-    int32_t fOld = g_cfg.gasCalMv[0];
-    bool fBroken = false;   // set only if the FULL anchor is replaced below
-    if (fMv > GAS_CAL_VALID_LO && fMv < GAS_CAL_VALID_HI && fMv != fOld) {
-        int32_t band  = inverted ? fOld + GAS_CAL_BAND_MV : fOld - GAS_CAL_BAND_MV;
-        bool better   = inverted ? (fMv > fOld) : (fMv < fOld);
-        bool clears   = inverted ? (fMv >= band) : (fMv <= band);
-        /* The band must fit inside the valid range, or the FULL anchor silently
-         * becomes un-committable again - which is the original bug. Asserted at
-         * build time rather than tested at runtime, so raising the floor is a
-         * compile failure and not a field report. kGasStockMv[0] is 1009. */
-        static_assert(GAS_CAL_VALID_LO < (int32_t)kGasStockMv[0] - GAS_CAL_BAND_MV,
-                      "GAS_CAL_VALID_LO leaves no room for the FULL anchor's band; "
-                      "the anchor would become un-committable (the 2f086c1 bug)");
-        /* A repair path that is gated on the broken value cannot repair it.
-         *
-         * The band is measured FROM the anchor, so an anchor that is itself
-         * off-scale puts the acceptable window where no real reading can reach
-         * it: {F=500} (hard-short record) has a band at 450 and only a
-         * reading below 450 would clear it, but gasLogUpdate's plausibility
-         * gate already refuses anything under 1000. The anchor is then stuck at
-         * a value gasCalMapTable() rejects, so the table stays discarded and the
-         * gauge runs on the stock span forever - there is no other writer, since
-         * the manual `Q F` path rejects the same off-scale values.
-         *
-         * The band exists to stop a jittery sample ratcheting a HEALTHY anchor,
-         * so it must not apply to an anchor that is not a tank reading. Any
-         * in-window reading replaces an off-scale one. This is not a licence to
-         * overwrite a good anchor: gasAnchorSane() uses the guard's own 1000 /
-         * 30000 limits, so on a table gasCalMapTable() accepts this term is
-         * always false and the committed behaviour is bit-for-bit the old one.
-         *
-         * What gets written is still gated: it must be inside the valid window
-         * and must have scored >=95% against the effective table, which on a
-         * rejected table means the stock span - i.e. a genuine full-tank
-         * voltage. The escape cannot write noise, only the end of the scale that
-         * the whole auto-cal feature exists to capture. */
-        fBroken = !gasAnchorSane(fOld);
-        if (fBroken || (better && clears)) {
-            g_cfg.gasCalMv[0] = (uint16_t)fMv;                       // FULL anchor
-            dirty = relin = true;
-            Serial.printf("gas auto-cal: F set = %u mv%s\n", g_cfg.gasCalMv[0],
-                          fBroken ? " (replacing off-scale FULL anchor)" : "");
-        }
-    }
-    int32_t eOld = g_cfg.gasCalMv[4];
-    bool eBroken = false;  // set only if the EMPTY anchor is replaced below
-    if (eMv > GAS_CAL_VALID_LO && eMv < GAS_CAL_VALID_HI && eMv != eOld) {
-        int32_t band  = inverted ? eOld - GAS_CAL_BAND_MV : eOld + GAS_CAL_BAND_MV;
-        bool better   = inverted ? (eMv < eOld) : (eMv > eOld);
-        bool clears   = inverted ? (eMv <= band) : (eMv >= band);
-        eBroken = !gasAnchorSane(eOld);   // same escape as FULL, see above
-        if (eBroken || (better && clears)) {
-            g_cfg.gasCalMv[4] = (uint16_t)eMv;                       // EMPTY anchor
-            dirty = relin = true;
-            Serial.printf("gas auto-cal: E set = %u mv%s\n", g_cfg.gasCalMv[4],
-                          eBroken ? " (replacing off-scale EMPTY anchor)" : "");
-        }
-    }
-    if (relin) {
-        /* The old code re-tapered the three mids unconditionally, which silently
-         * undid any `Q 1/2/3` refinement on the next full-to-empty drive. The
-         * only trace was one line on Serial, and the dash is sent nothing but the
-         * percentage in f[5], so from the driver's seat the calibration silently
-         * stopped being the one they set.
-         *
-         * It also made the mid-scale reading DRIFT. A 50 mV nudge of the FULL
-         * anchor re-tapered 1/2 from 9800 mV to 13014 mV - a 33% move of the
-         * half-tank point - for a change at the very top of the scale.
-         *
-         * POLICY: the operator's and the factory's mid anchors WIN.
-         *
-         * They and the endpoints are independent measurements. A mid is the
-         * sender voltage at a fuel level somebody could see (or the OE curve);
-         * an endpoint is the voltage at a stop. The same 11000 mV is still half
-         * a tank after the FULL anchor moves, so discarding it loses information
-         * rather than maintaining a curve. The derived taper exists to fill slots
-         * that were never measured, not to overrule the ones that were.
-         *
-         * THE EXCEPTION, and it is the M11 escape: if the endpoint that just
-         * moved was itself off-scale, the mids that came with it were
-         * interpolated from a table that is not a tank calibration at all. There
-         * is nothing to salvage and the straight taper is the honest answer, so
-         * a table being rescued is rebuilt flat and a healthy one is not.
-         *
-         * Whatever is kept must still be monotonic, or gasPctFromMv walks a
-         * non-monotonic segment list and returns a wrong percentage without any
-         * indication that anything is wrong. */
-        gasRelinMids(!(fBroken || eBroken));
-    }
-    if (dirty) {
-        s_gasFilt = -1;                          // reseed filter after cal change
-        // The gates are "observations under the current table", and the table
-        // just moved, so whatever was seen under the old one no longer counts.
-        s_fullPctSinceCal = -1;  s_fullMvSinceCal = -1;
-        s_emptyPctSinceCal = 101; s_emptyMvSinceCal = -1;
-        // The percentages in the log are now displayed against a calibration
-        // that no longer exists; re-derive them from the recorded mV so the band
-        // matches the needle. (They are no longer used as gates.)
-        if (gasLogRescore()) gasLogSave();
-        saveCfg();
-    }
+    if (pct < s_gasHist.minPct) { s_gasHist.minPct = (int8_t)pct; changed = true; }
+    if (pct > s_gasHist.maxPct) { s_gasHist.maxPct = (int8_t)pct; changed = true; }
+    if (mv  < s_gasHist.minMv)  { s_gasHist.minMv  = (int16_t)mv; changed = true; }
+    if (mv  > s_gasHist.maxMv)  { s_gasHist.maxMv  = (int16_t)mv; changed = true; }
+    if (changed) gasHistorySave();
 }
 
 // Needle gauge: center pivot (120,128), 240 deg sweep (150..390) across the top,
@@ -1987,7 +1693,7 @@ static void drawGasFrame() {
     s_gasTft->fillScreen(GC9A01A_BLACK);
     s_gasTft->drawCircle(GAS_CX, GAS_CY, 119, GC9A01A_NAVY);
     s_gasTft->drawCircle(GAS_CX, GAS_CY, 118, GC9A01A_DARKGREY);
-    drawGasRing(GAS_A0, GAS_A1, s_gasLog.minPct, s_gasLog.maxPct);
+    drawGasRing(GAS_A0, GAS_A1, s_gasHist.minPct, s_gasHist.maxPct);
     drawGasMarks();
     s_gasTft->setTextColor(GC9A01A_LIGHTGREY);
     s_gasTft->setTextSize(1);
@@ -2019,8 +1725,8 @@ static void drawGasFrame() {
     // bare: the band stayed gone until the float's lifetime min or max happened to
     // change, and the "erase the previous band" loop then scribbled dark ticks
     // over a region that had just been filled, for a band that no longer existed.
-    s_bandMin = s_gasLog.minPct;
-    s_bandMax = s_gasLog.maxPct;
+    s_bandMin = s_gasHist.minPct;
+    s_bandMax = s_gasHist.maxPct;
 }
 
 static void updateGasDisplay() {
@@ -2062,7 +1768,7 @@ static void updateGasDisplay() {
          * sit at r=70, inside the ring, so the triangle reaches them too. */
         drawGasRing(s_needleDeg - GAS_NEEDLE_WEDGE_DEG,
                     s_needleDeg + GAS_NEEDLE_WEDGE_DEG,
-                    s_gasLog.minPct, s_gasLog.maxPct);
+                    s_gasHist.minPct, s_gasHist.maxPct);
         drawGasMarks();
     }
 
@@ -2082,7 +1788,7 @@ static void updateGasDisplay() {
      * to run last, which meant a band change could paint over the live needle
      * without restoring it; moving it here removes that, and the ring is
      * otherwise untouched by the needle because the needle is drawn afterwards. */
-    int16_t bMin = s_gasLog.minPct, bMax = s_gasLog.maxPct;
+    int16_t bMin = s_gasHist.minPct, bMax = s_gasHist.maxPct;
     if (bMin != s_bandMin || bMax != s_bandMax) {
         // bMin < 0 means there is no band at all now (unseeded log), so the whole
         // arc has to be restored rather than just the old band's span.
@@ -2133,15 +1839,13 @@ static void updateGasDisplay() {
      * calibration actually depends on. A permanent element on a gauge you
      * already know is a cost, not a free diagnostic.
      *
-     * The BEHAVIOUR is unchanged and is the part that mattered: a `Q 1/2/3`
-     * refinement is now preserved across a full-to-empty drive instead of being
-     * overwritten by a derived taper (M12). That no longer needs telling the
-     * driver, because it no longer happens.
+     * The traceability that the badge was invented for is on the console: `Q`
+     * prints the live anchor table. Serial is the right place for a one-time
+     * calibration fact; the gauge is for driving.
      *
-     * The traceability that the badge was invented for still exists on the
-     * console: `Q` prints the live anchor table, and gasAutoCal() prints which
-     * anchor it moved. Serial is the right place for a one-time calibration
-     * fact; the gauge is for driving. */
+     * Nothing needs a badge now anyway. The whole auto-calibration feature went
+     * with it (2026-10-02): nothing moves an anchor on its own, so there is no
+     * "which curve is in effect" question left to answer. */
 
 }
 
@@ -2962,7 +2666,7 @@ static void handleCommand(const String& line) {
         }
         case 'Q':
             // Q              -> dump gas calibration + current reading
-            // Q R / Q RESET  -> wipe calibration + gas log back to stock
+            // Q R / Q RESET  -> wipe calibration + gas history back to stock
             // Q F / E / 1/2/3 -> record CURRENT A4 reading as FULL/EMPTY/1/4/HALF/3/4
             // Q D <0-15>     -> damping strength (0 = raw)
             // Q W <5-90>     -> low-fuel warning %
@@ -2971,10 +2675,8 @@ static void handleCommand(const String& line) {
             if (val == "R" || val == "RESET") {
                 memcpy(g_cfg.gasCalMv, kGasStockMv, sizeof(g_cfg.gasCalMv));
                 s_gasFilt = -1;
-                s_gasLog = GasLog{};
-                s_fullPctSinceCal = -1;  s_fullMvSinceCal  = -1;   // table moved
-                s_emptyPctSinceCal = 101; s_emptyMvSinceCal = -1;  // old obs don't count
-                gasLogSave();
+                s_gasHist = GasHistory{};
+                gasHistorySave();
                 saveCfg();
                 Serial.println("gas cal + log reset to stock (F=1009 E=25014) - now press SET FULL at a full tank, SET EMPTY at empty");
                 break;
@@ -3009,16 +2711,11 @@ static void handleCommand(const String& line) {
                     }
                 }
                 s_gasFilt = -1;                     // reseed filter after cal change
-                // The auto-cal gates are "seen >=95% / <=5% under the CURRENT
-                // table", so they are void the moment the table moves. Without
-                // this, a `Q E 18000` could be immediately overwritten by
-                // auto-cal from the very reading the operator just rejected.
-                s_fullPctSinceCal = -1;  s_fullMvSinceCal  = -1;
-                s_emptyPctSinceCal = 101; s_emptyMvSinceCal = -1;
-                // The log's percentages now describe a calibration that no longer
-                // exists; re-derive them from the recorded mV so the band matches
-                // the needle. ('Q R' above needs no rescore — it wipes the log.)
-                if (gasLogRescore()) gasLogSave();
+                // The stored percentages now describe a calibration that no longer
+                // exists; re-derive them from the recorded mV so the history band
+                // matches the needle. ('Q R' above needs no rescore — it wipes the
+                // history.)
+                if (gasHistoryRescore()) gasHistorySave();
                 saveCfg();
                 Serial.printf("gas point %u = %u mv\n", slot, g_cfg.gasCalMv[slot]);
                 break;
@@ -3111,17 +2808,17 @@ static void handleCommand(const String& line) {
                           g_cfg.gasDamp, g_cfg.lowFuelPct, g_cfg.gasMpg, g_cfg.tankGalX10 / 10.0f,
                           g_cfg.gasCalMv[0], g_cfg.gasCalMv[1], g_cfg.gasCalMv[2],
                           g_cfg.gasCalMv[3], g_cfg.gasCalMv[4]);
-            if (s_gasLog.minPct < 0)
-                Serial.println("gas log: unseeded (learns from first tank read)");
+            if (s_gasHist.minPct < 0)
+                Serial.println("gas history: unseeded (learns from first tank read)");
             else
-                Serial.printf("gas log: LO %d%% (%dmv) HI %d%% (%dmv)\n",
-                              s_gasLog.minPct, s_gasLog.minMv,
-                              s_gasLog.maxPct, s_gasLog.maxMv);
+                Serial.printf("gas history: LO %d%% (%dmv) HI %d%% (%dmv)\n",
+                              s_gasHist.minPct, s_gasHist.minMv,
+                              s_gasHist.maxPct, s_gasHist.maxMv);
             {
                 const uint16_t *gc = g_cfg.gasCalMv;
                 /* This was a THIRD hand-written copy of the poison predicate, the
-                 * other two being inside gasCalMapTable() and gasAnchorSane().
-                 * Three copies of one predicate is three places for a future
+                 * other being inside gasCalMapTable(). Three copies of one
+                 * predicate is three places for a future
                  * change to miss, and the failure is silent and wrong: the
                  * console would report the table healthy while the gauge mapped
                  * against the stock span instead, or vice versa. Ask the owner,
@@ -3247,8 +2944,8 @@ static void handleCommand(const String& line) {
                 memset(s_diagMac, 0, sizeof(s_diagMac));
                 saveDashMac();
                 saveDiagMac();
-                s_gasLog = GasLog{};
-                gasLogSave();
+                s_gasHist = GasHistory{};
+                gasHistorySave();
                 for (uint8_t i = 0; i < 4; i++) {
                     s_anForce[i] = -1;          // bench override
                     s_anLow[i]   = false;       // saved polarity — THIS is what
@@ -3263,8 +2960,6 @@ static void handleCommand(const String& line) {
                 s_buzzManual = false;
                 s_buzzManualUntilMs = 0;
                 s_buzzLoop   = false;
-                s_fullPctSinceCal = -1;  s_fullMvSinceCal  = -1;
-                s_emptyPctSinceCal = 101; s_emptyMvSinceCal = -1;
                 s_gasFilt = -1;
                 applyPinConfig();
                 // Same trap on the backlight: g_cfg.ledOn is now false, but the
@@ -3273,7 +2968,7 @@ static void handleCommand(const String& line) {
                 // ledInit() and the `L` handler. "Reboot not required" was a lie.
                 ledApply();
                 tftReinitRequest();
-                Serial.println("FACTORY RESET: cfg + gas table + gas log + peer filters + A1-A4 polarity");
+                Serial.println("FACTORY RESET: cfg + gas table + gas history + peer filters + A1-A4 polarity");
                 Serial.println("              + LED bar + buzzer overrides, all back to defaults.");
                 if (s_nvsOk && wipeOk) {
                     Serial.println("              Reboot not required.");
@@ -3898,7 +3593,7 @@ void setup() {
      * core never calls esp_task_wdt_init() itself. So a hung loop() was
      * indistinguishable from a running one. The box would stop driving the fan
      * relay, the IAC and the buzzer, stop sending the 10 Hz status frame, stop
-     * the ABS speed window and stop the gas log - and from the driver's seat
+     * the ABS speed window and stop the gas history - and from the driver's seat
      * the gauges would simply freeze, with nothing indicating anything was
      * wrong. That is the failure this is here to catch.
      *
@@ -3919,7 +3614,7 @@ void setup() {
      *           display guard requires s_tftStep == TFT_IDLE, and
      *           tftReinitStep() returns immediately in TFT_IDLE. The two
      *           expensive paths can never share a pass.
-     *   200 ms  gasLogUpdate() -> gasLogSave() on a new lifetime extreme: an
+     *   200 ms  gasHistoryUpdate() -> gasHistorySave() on a new lifetime extreme: an
      *           NVS commit, i.e. a flash erase. Not measured in this file.
      *   300 ms  handleCommand(), one command per pass: worst is `P WIPE`, whose
      *           g_prefs.clear() erases the whole namespace. No command calls
@@ -3950,7 +3645,7 @@ void setup() {
      *
      * RESET SAFETY: nothing needs saving first, and nothing safe can be forced
      * first. Every persistent value is written to NVS at the point it changes
-     * (saveCfg() on each config change, gasLogSave() on a new extreme), so a
+     * (saveCfg() on each config change, gasHistorySave() on a new extreme), so a
      * reset loses nothing a power cycle would not also lose, and nothing here
      * lives in RTC memory. The TWDT has no callback and a panic handler runs
      * with interrupts off on an arbitrary core, where digitalWrite() is not
@@ -4012,15 +3707,15 @@ void setup() {
         Serial.println("      Check free flash and that the NVS partition exists.");
     }
     loadCfg();
-    gasLogLoad();
+    gasHistoryLoad();
     // Re-score the log's percentages against the table that was actually loaded.
     // Normally a no-op (they were scored against this same table when written),
     // but loadCfg() can have just replaced the table wholesale — a magic bump or
-    // a corrupt blob falls back to defaults while the gas log survives in its own
+    // a corrupt blob falls back to defaults while the gas history survives in its own
     // NVS key. Without this the float-history band is drawn from percentages that
     // describe a calibration that no longer exists, and nothing would correct it
     // until the tank next reached a new lifetime extreme.
-    if (s_nvsOk && gasLogRescore()) gasLogSave();
+    if (s_nvsOk && gasHistoryRescore()) gasHistorySave();
     loadDashMac();
     loadDiagMac();
     loadAnPol();
@@ -4051,7 +3746,7 @@ void loop() {
     s_canFresh = s_anyGroupSeen && (millis() - s_lastFrameMs) < FAILSAFE_MS;
     decodeOutpc();
     // Sample the fuel sender on a FIXED cadence, before any consumer, so every
-    // reader below (0xB0 frame, gas log, gas display, low-fuel buzzer test,
+    // reader below (0xB0 frame, gas history, gas display, low-fuel buzzer test,
     // Serial status) maps the same sample and they can never disagree.
     //
     // Fixed cadence, not once per loop() pass. Two reasons:
@@ -4059,7 +3754,7 @@ void loop() {
     //  - gasDamp has to mean a time constant, and that only holds if the sample
     //    RATE is fixed. Once per pass made it (gasDamp+1) x loop_period, and
     //    this same batch made loop_period wildly variable: a TFT re-init step
-    //    runs ~300 ms, and gasLogUpdate can commit to NVS (a flash erase) on a
+    //    runs ~300 ms, and gasHistoryUpdate can commit to NVS (a flash erase) on a
     //    new extreme. The damping would change by 5x depending on whether the
     //    display was being re-initialised.
     //  - Per pass it also over-sampled. Before the split, the EMA advanced only
@@ -4111,10 +3806,10 @@ void loop() {
     // worth splitting at all.
     tftReinitStep();
 
-    static uint32_t gasLogLast = 0;
-    if (now - gasLogLast >= 100) {
-        gasLogLast = now;
-        gasLogUpdate();       // independent of TFT: logs forever, even TFT off
+    static uint32_t gasHistLast = 0;
+    if (now - gasHistLast >= 100) {
+        gasHistLast = now;
+        gasHistoryUpdate();       // independent of TFT: logs forever, even TFT off
     }
 
     // Drain queued 0xC0 commands (executed in loop context, not WiFi task).
