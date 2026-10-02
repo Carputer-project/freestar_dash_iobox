@@ -305,20 +305,42 @@ static void loadAnPol() {
 }
 
 static void updateAnalogLatch() {
-    // Debounce: a latch flips only after AN_DEBOUNCE consecutive agreeing
-    // reads (~100ms at loop cadence). Kills ADC noise/crosstalk chatter on
-    // car-harness-length inputs; far shorter than a 1-2Hz flasher phase.
-    static bool    candState[4] = { false, false, false, false };
-    static uint8_t candCnt[4]   = { 0, 0, 0, 0 };
-    constexpr uint8_t AN_DEBOUNCE = 30;
+    /* Debounce: a latch flips only after the candidate state has held for
+     * AN_DEBOUNCE_MS of WALL CLOCK.
+     *
+     * This was AN_DEBOUNCE = 30 loop ITERATIONS, with the comment claiming
+     * "~100ms at loop cadence". It cannot be 100 ms: the loop ends in delay(2),
+     * so 30 passes cost at least 60 ms before any work is counted, and this
+     * file's own cost itemisation puts the 10 Hz display block at up to 365 ms
+     * in a single pass (updateDisplay() + updateGasDisplay()). So the real
+     * debounce was 30 x loop period - roughly 600 ms with the displays off and
+     * up to ~11 s in the worst case, and it MOVED with loop load rather than
+     * being a time.
+     *
+     * That is not cosmetic for a flasher. candCnt reset to 1 on every change of
+     * `raw`, so a latch needed 30 CONSECUTIVE agreeing iterations. A 1-2 Hz
+     * indicator or hazard is on for 330-500 ms; at any loop period above ~11 ms
+     * that is fewer than 30 passes, so it could never latch at all - the input
+     * silently stopped working whenever the gauges were busy, with nothing on
+     * the console. (Flagged honestly: whether a given flasher survived in the
+     * field depends on the real loop period, which was never measured. The
+     * iteration-count debounce is removed either way.)
+     *
+     * millis() arithmetic is unsigned and rolls over correctly, and the
+     * candidate timestamp is re-armed whenever `raw` changes, so a slow pass
+     * cannot shorten or lengthen the window. */
+    static bool     candState[4] = { false, false, false, false };
+    static uint32_t candSince[4]  = { 0, 0, 0, 0 };
+    constexpr uint16_t AN_DEBOUNCE_MS = 100;
 
+    uint32_t now = millis();
     for (uint8_t i = 0; i < 4; i++) {
         if (s_anForce[i] >= 0) {          // bench override wins over everything
             s_anLatch[i] = s_anForce[i] == 1;
-            candCnt[i] = 0;
+            candSince[i] = now;
             continue;
         }
-        if (!g_cfg.anEnable[i]) { s_anLatch[i] = false; candCnt[i] = 0; continue; }
+        if (!g_cfg.anEnable[i]) { s_anLatch[i] = false; candSince[i] = now; continue; }
         int16_t t = (int16_t)g_cfg.anThresh[i];
         int16_t mv = (int16_t)min(readAnalogMv(i), (uint16_t)32767);   // clamp: >32767 would cast negative
         bool raw;
@@ -330,9 +352,8 @@ static void updateAnalogLatch() {
             int16_t lo = t > 150 ? t - 150 : 0;
             raw = s_anLatch[i] ? (mv > lo) : (mv >= t);
         }
-        if (raw != candState[i]) { candState[i] = raw; candCnt[i] = 1; }
-        else if (candCnt[i] < 255) candCnt[i]++;
-        if (candCnt[i] >= AN_DEBOUNCE && s_anLatch[i] != raw) s_anLatch[i] = raw;
+        if (raw != candState[i]) { candState[i] = raw; candSince[i] = now; }
+        if (now - candSince[i] >= AN_DEBOUNCE_MS && s_anLatch[i] != raw) s_anLatch[i] = raw;
     }
 }
 
@@ -2482,7 +2503,19 @@ static void handleCommand(const String& line) {
             bool accept = true;
             if (mode == "0") { g_cfg.outMode[n] = OM_OFF; }
             else if (mode == "1") { g_cfg.outMode[n] = OM_MAN; g_cfg.outManual[n] = true; }
-            else if (mode == "A") { g_cfg.outMode[n] = OM_OFF; }
+            else if (mode == "A") {
+                /* There is no per-output AUTO mode - OutMode is {OFF, MAN, TEMP,
+                 * RPM} and nothing selects on its own. `O<n> A` used to fall into
+                 * OM_OFF silently and was absent from the help string, so
+                 * `O3 A` (surely meaning "let the box decide") turned a live
+                 * output OFF and printed nothing at all. Refused, and it says
+                 * what to type instead. Was undocumented, so nothing in the
+                 * field can be relying on it. */
+                accept = false;
+                Serial.printf("O%u A: no auto mode. Use O%u 0 (off), O%u 1 (manual), "
+                              "O%u T<f> (coolant) or O%u R<rpm> (rev).\n",
+                              n + 1, n + 1, n + 1, n + 1, n + 1);
+            }
             else if (mode.startsWith("T")) {
                 /* Check the STRING, then range-check the float, then cast.
                  * `O6T` with no number is a case of "cannot parse", so toFloat()
@@ -2582,13 +2615,30 @@ static void handleCommand(const String& line) {
                 g_cfg.ledOn = true;
                 saveCfg();
                 ledApply();
+            } else {
+                /* sscanf returns the count of fields it managed to convert, so
+                 * `L abc`, `L 10 20` (two of three) and `L 300` all fall through
+                 * with nothing done and - before this - nothing said. Same
+                 * "a refused command must change nothing AND say so" rule the
+                 * O/Y/A arms follow. Out-of-range values are still CLAMPED
+                 * rather than refused, which is the documented behaviour of the
+                 * constrain() family elsewhere in this file. */
+                Serial.printf("L: expected 3 numbers r g b, got \"%s\" "
+                              "(each 0-%u, clamped) | L 0 = off | L ? = report\n",
+                              val.c_str(), LED_BRIGHT_MAX);
             }
             break;
         }
         case 'A': {
-            if (val.length() < 2) return;
+            /* A refused index must SAY SO. These two used to `return` with no
+             * message, so `A`, `A0`, `A5`, `A9`, `AZ` were indistinguishable from
+             * a lost command - the identical defect the `O` and `Y` arms had and
+             * had already been fixed for. `A0` is the nastiest: val[0]-'1' is
+             * -1, which becomes 255 as a uint8_t, so the "1..4" channel number
+             * the operator typed is silently reinterpreted as out of range. */
+            if (val.length() < 2) { Serial.println("A<n> <form>, n=1..4 | forms: 0 | D1/D0/DA | H<v> | L<v> | O<k> <v> | F <v> | <v>"); break; }
+            if (val[0] < '1' || val[0] > '4') { Serial.println("A<n> <form>, n=1..4 (got '" + String(val[0]) + "')"); break; }
             uint8_t n = (uint8_t)(val[0] - '1');
-            if (n > 3) return;
             String m = val.substring(1);
             m.trim();
             /* A rejected sub-form must not reach saveCfg() at the foot of this
@@ -2702,22 +2752,42 @@ static void handleCommand(const String& line) {
                 // H<v> = active-high threshold, L<v> = active-low (GND-switched).
                 // L-mode latches when the wire is PULLED TO GND — only for
                 // circuits that idle at ~12V through their lamp filament.
-                float v = m.substring(1).toFloat();
+                /* argIsFloat() HERE TOO, like the O and F arms above. It was
+                 * missing on this path and on the plain form below, so
+                 * toFloat()'s "stop at the first bad character" rule applied:
+                 * "A1H 12abc" is 12.0 and was accepted as a valid threshold.
+                 *
+                 * And a rejected value must set accept = false, which it did
+                 * not: `A1H abc` parses to 0.0, fails the range check, printed
+                 * NOTHING (no else), changed nothing - and then still fell
+                 * through to saveCfg() at the foot of this arm. That is exactly
+                 * what the comment above `bool accept` forbids, and it was the
+                 * last path in the arm that could still do it. */
+                String tArg = m.substring(1);
+                tArg.trim();
+                float v = argIsFloat(tArg) ? tArg.toFloat() : -1.0f;
                 if (v >= 0.1f && v <= 15.0f) {
                     g_cfg.anEnable[n] = true;
                     g_cfg.anThresh[n] = (uint16_t)(v * 1000.0f);
                     s_anLow[n] = (m[0] == 'L');
                     saveAnPol();
                     Serial.printf("a%u thr=%.1fV %s\n", n + 1, v, s_anLow[n] ? "LOW(gnd)" : "HIGH(12V)");
+                } else {
+                    accept = false;
+                    Serial.printf("A%u %c<v>, v=0.1-15.0V (got \"%s\")\n", n + 1, m[0], tArg.c_str());
                 }
             } else {
                 // Plain form: active-high threshold
-                float v = m.toFloat();
+                float v = argIsFloat(m) ? m.toFloat() : -1.0f;
                 if (v >= 0.1f && v <= 15.0f) {
                     g_cfg.anEnable[n] = true;
                     g_cfg.anThresh[n] = (uint16_t)(v * 1000.0f);
                     s_anLow[n] = false;
                     saveAnPol();
+                    Serial.printf("a%u thr=%.1fV HIGH(12V)\n", n + 1, v);
+                } else {
+                    accept = false;
+                    Serial.printf("A%u <v>, v=0.1-15.0V (got \"%s\")\n", n + 1, m.c_str());
                 }
             }
             if (accept) saveCfg();
