@@ -266,7 +266,10 @@ static uint16_t readAnalogMv(uint8_t i) {
 static const char* tgtName(uint8_t t) {
     static char buf[8];
     if (t == 0) return "-";
-    if (t == 7) return "fan";
+    /* "fan" is WHATEVER OUTPUT THE FAN IS ON, which is not always 7. It was
+     * hardcoded to 7, so every confirmation line named the wrong thing as soon
+     * as `Y <k>` moved the fan anywhere else - and fanOut defaults to 6. */
+    if (t >= 1 && t <= 7 && t == g_cfg.fanOut) return "fan";
     snprintf(buf, sizeof buf, "O%u", t);
     return buf;
 }
@@ -858,6 +861,48 @@ static const char* topWarnName(uint16_t raw) {
     return "";
 }
 
+/* AFR alarm-threshold window and reading-sanity window, x10 units
+ * (50 = AFR 5.0). Both are named because they MUST NOT CROSS OVER, and that is
+ * enforced at compile time below rather than left to a reviewer.
+ *
+ * The sanity floor was 100 and afrLow defaults to 100, so
+ *
+ *     W_RICH = afrOk && g_afr < afrLow   =   afrOk && g_afr < 100
+ *     afrOk  =                          ... && g_afr >= 100
+ *
+ * required 100 <= afr < 100: the empty set. W_RICH could not fire at ANY AFR,
+ * at the shipped default or at any other setting the operator could reach -
+ * exhaustive sweep of afr = 1..250 returns zero hits. W_LEAN worked only
+ * because afrHigh (165) sits well above the floor, so the "sanity" gate was
+ * really just a second, tighter rich threshold wearing the wrong name.
+ *
+ * AFR was the ONLY field with that collision:
+ *
+ *     clt   floor 100   alarm 2300    clear
+ *     mat   floor 0     alarm 1600    clear
+ *     batt  floor 0     alarm 110     clear
+ *     map   floor 0     alarm 2800    clear
+ *     afr   floor 100   alarm 100     COLLISION
+ *
+ * AFR_OK_MIN is 30 (AFR 3.0): below the 50 floor of the `W afr` clamp, so no
+ * setting the operator can reach is un-warnable, and above the ~2.0 an
+ * unplugged wideband reports, so a disconnected sensor cannot pose as a rich
+ * one. AFR_OK_MAX matches AFR_CLAMP_HI, which is already where the reading was
+ * being cut off.
+ *
+ * NOTE the dash disagreed, and still does: esp32_ms_dash/main/ui.c uses a floor
+ * of 90, so it could raise RICH across a 1.0-wide band (AFR 9.0-9.9) while the
+ * box stayed silent - the driver got a lamp with no buzzer and no warn relay.
+ * These two windows have to match; ui.c carries its own copy. */
+static constexpr int16_t AFR_CLAMP_LO = 50;    // `W afr <lo>` cannot go below this
+static constexpr int16_t AFR_CLAMP_HI = 250;
+static constexpr int16_t AFR_OK_MIN    = 30;    // reading-sanity floor
+static constexpr int16_t AFR_OK_MAX    = 250;   // reading-sanity ceiling
+static_assert(AFR_OK_MIN < AFR_CLAMP_LO,
+              "the AFR sanity floor must stay below the smallest legal afrLow; "
+              "otherwise W_RICH is un-warnable at that setting (the 100/100 bug)");
+static_assert(AFR_CLAMP_LO < AFR_CLAMP_HI, "W afr lo must be below hi");
+
 static uint16_t engineWarnFlags() {
     uint16_t raw = 0;
     if (!s_canFresh) return 0;
@@ -870,7 +915,10 @@ static uint16_t engineWarnFlags() {
      * engine - and latched W_OVERBOOST permanently. */
     bool mapOk = groupSeen(2) && g_map > 0 && g_map < 4000;
     bool onThrottle = groupSeen(3) && g_tps >= 50;
-    bool afrOk = onThrottle && g_afr >= 100 && g_afr <= 250;
+    /* AFR was the one field whose sanity floor was NOT below its own alarm
+     * threshold: the floor was 100 and afrLow defaults to 100, so W_RICH needed
+     * 100 <= afr < 100 and could never fire. See AFR_OK_MIN above. */
+    bool afrOk = onThrottle && g_afr >= AFR_OK_MIN && g_afr <= AFR_OK_MAX;
 
     // Partial-frame hardening: only trust a field if its group was present in
     // the current frame. On a real 0xA0 broadcast all 9 groups arrive together,
@@ -2614,19 +2662,35 @@ static void handleCommand(const String& line) {
                     Serial.printf("A%u O<k> <v>, k=1..7 v=0.1-15.0V (got \"%s\")\n", n + 1, m.c_str());
                 }
             } else if (m.startsWith("F")) {
-                /* Same two-part contract as the O arm, same order of checks. F is
-                 * just the fan output (7) spelled out. */
+                /* Same two-part contract as the O arm, same order of checks.
+                 *
+                 * F means "the FAN output" - which is g_cfg.fanOut, not a literal
+                 * 7. It was hardcoded, so with the shipped fanOut of 6 (or any
+                 * `Y <k>`) the mapping pointed at a DIFFERENT pin than the one
+                 * setFan() drives, while the confirmation line printed
+                 *     a1 fan thr=12.0V HIGH(12V)
+                 * i.e. it named the fan on both sides of a mapping that never
+                 * touched it. The latch then forced output 7 through
+                 * inputForces(i+1) and the real fan stayed where it was.
+                 *
+                 * fanOut == 0 means "no fan output": setFan() writes nothing at
+                 * fanOut == 0, so there is nothing to map to and the command is
+                 * refused rather than silently landing on output 0 (= "-"). */
                 String tArg = m.substring(1);
                 tArg.trim();
                 float v = argIsFloat(tArg) ? tArg.toFloat() : -1.0f;
-                if (v >= 0.1f && v <= 15.0f) {
+                if (g_cfg.fanOut < 1 || g_cfg.fanOut > 7) {
+                    accept = false;
+                    Serial.printf("A%u F <v>: no fan output to map to (fanOut=%u). "
+                                  "Set one with Y <1-7> first.\n", n + 1, g_cfg.fanOut);
+                } else if (v >= 0.1f && v <= 15.0f) {
                     bool wasLow = s_anLow[n];
-                    g_cfg.anOut[n] = 7;
+                    g_cfg.anOut[n] = g_cfg.fanOut;
                     g_cfg.anEnable[n] = true;
                     g_cfg.anThresh[n] = (uint16_t)(v * 1000.0f);
                     s_anLow[n] = false;   // F carries no polarity: same reset as O
                     saveAnPol();
-                    Serial.printf("a%u %s thr=%.1fV %s\n", n + 1, tgtName(7), v,
+                    Serial.printf("a%u %s thr=%.1fV %s\n", n + 1, tgtName(g_cfg.fanOut), v,
                                   s_anLow[n] ? "LOW(gnd)" : "HIGH(12V)");
                     if (wasLow) Serial.printf("a%u polarity was LOW(gnd), reset to HIGH(12V): "
                                                "an idling-12V wire will now latch ON, use A%uL<v> for gnd-switched\n", n + 1, n + 1);
@@ -3267,8 +3331,8 @@ static void handleCommand(const String& line) {
                 g_cfg.eng.mapMax = (int16_t)t;
             } else if (k == "afr" && a > 0) {
                 int lo, hi;
-                if (!num10(p1, 50, 250, lo)) { reject(k, p1); break; }
-                if (!num10(p2, 50, 250, hi)) { reject(k, p2); break; }
+                if (!num10(p1, AFR_CLAMP_LO, AFR_CLAMP_HI, lo)) { reject(k, p1); break; }
+                if (!num10(p2, AFR_CLAMP_LO, AFR_CLAMP_HI, hi)) { reject(k, p2); break; }
                 if (hi < lo) { int t = lo; lo = hi; hi = t; }
                 g_cfg.eng.afrLow = (int16_t)lo;
                 g_cfg.eng.afrHigh = (int16_t)hi;
