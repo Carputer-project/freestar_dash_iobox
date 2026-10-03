@@ -70,23 +70,20 @@ enum OutMode : uint8_t { OM_OFF = 0, OM_MAN = 1, OM_TEMP = 2, OM_RPM = 3 };
 static constexpr uint8_t  FRAME_ECU    = 0xA0;
 static constexpr uint8_t  FRAME_STATUS = 0xB0;
 static constexpr uint8_t  FRAME_CMD    = 0xC0;
-static constexpr uint8_t  FRAME_REPLY  = 0xD0;   // box -> console: OTA cmd ack + snapshot
 static constexpr uint8_t  ESP_NOW_CHANNEL = 1;
 static const uint8_t      ESP_NOW_BROADCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-enum WarnBit : uint16_t {
-    W_IDLE_LO = 1 << 0,
-    W_IDLE_HI = 1 << 1,
-    W_OVERREV = 1 << 2,
-    W_OVERHEAT = 1 << 3,
-    W_HOTAIR = 1 << 4,
-    W_LOWBATT = 1 << 5,
-    W_HIBATT = 1 << 6,
-    W_OVERBOOST = 1 << 7,
-    W_LEAN = 1 << 8,
-    W_RICH = 1 << 9,
-};
-
+/* Engine-warning thresholds are GONE from the box (user: warnings are not needed
+ * on iobox). The dash computes all seven itself in ui.c:warn_evaluate() and
+ * only falls back to the box mask afterwards, so nothing is lost but a
+ * redundant second opinion.
+ *
+ * struct EngineProfile is nevertheless KEPT, and this is the whole reason:
+ * loadCfg() rejects the stored blob unless `len == sizeof(g_cfg)` and the magic
+ * matches, then writes defaults. Dropping these fields would change sizeof(Cfg),
+ * the stored config would be rejected on first flash, and defaults would be
+ * written over gasCalMv[] (the calibrated gas table) and the whole pin map. So
+ * the struct stays, byte-for-byte, as layout ballast. Do not "tidy it away". */
 struct EngineProfile {
     bool    enabled = true;
     int16_t idleRpmMin = 700;
@@ -115,6 +112,22 @@ struct PinMap {
 };
 
 static constexpr uint16_t CFG_MAGIC = 0x4971;   // 0x4970→0x4971: wipe poisoned gas table (E=0 inversion), adopt 220R-front-end defaults
+/* No schema/version byte, deliberately.
+ *
+ * I added one, bumped CFG_MAGIC to 0x4972 to carry it, and shipped it inside a
+ * bug-fix batch without saying what it does. It wipes your gas calibration and
+ * pin map on first flash — sizeof(Cfg) grows, so loadCfg() rejects the stored
+ * blob and writes defaults, and you would have discovered that from a tank
+ * reading full instead of from me.
+ *
+ * The protection is worth having on paper and not worth this price. sizeof()
+ * already catches every layout change that alters the struct's size, which is
+ * almost all of them; CFG_MAGIC is the deliberate, documented reset for the rest.
+ * The byte only adds protection against a same-size field reorder, which is a
+ * future hypothetical, and it costs a real tank calibration on a real car today.
+ *
+ * If a layout change ever does need guarding, bump CFG_MAGIC and SAY SO in the
+ * commit message — the reset is the intended behaviour, not a side effect. */
 // Stock gas anchors (reported mV) for the 220R-from-3V3 A4 front end:
 // FULL=3R/1009, EMPTY=110R/25014 (Toyota FSM sender spec). Used by `Q R` to
 // clear poisoned calibration and as a safe mapping fallback in gasPctFromFilt()
@@ -131,7 +144,28 @@ struct Cfg {
     bool    fanAuto = true;
     bool    fanManual = false;
     int16_t iacTargetRpm = 900;
-    uint8_t iacFailDuty = 0;
+    /* Idle-air duty applied when the ECU link is down and the engine is NOT
+     * running. 35, not 0.
+     *
+     * The default was 0, and per the note on setIac() 0% is the CLOSED stop
+     * (94% is mechanical full-open), so the box's response to losing the ECU
+     * was to slam the rotary ISC shut. It only ever reached that on the
+     * engine-stopped path, which limits the damage - but "engine stopped" is
+     * decided by `groupSeen(0) && g_rpm > 300` off the LAST decoded frame, and a
+     * reset ECU that stops broadcasting after one bad frame, or a crank that
+     * never reaches 300 rpm, both land there with the engine running. A stalled
+     * engine with the valve commanded shut is a restart at best.
+     *
+     * 35% is inside the normal idle range (interpolateIac() returns 60..28 over
+     * 50..200 degF), so it keeps the valve near where a warm idle sits instead
+     * of slamming an endstop.
+     *
+     * There was also no way to CHANGE this: grep found only the `= 0` default
+     * and two call sites, so the one fail-safe value that could strand an engine
+     * was unreachable without a reflash. (A `I B <0-100>` setter existed for a
+     * while and was removed again — 35 is the correct shipped value and an
+     * air-reachable command that opens an idle-air fail-safe is not worth it.) */
+    uint8_t iacFailDuty = 35;
     bool    iacAuto = false;
     bool    iacFollow = true;               /* default idle mode = FOLLOW MS */
     uint8_t iacManualDuty = 30;
@@ -209,15 +243,6 @@ static uint32_t g_rpm = 0;
 static int16_t  g_map = 0, g_mat = 0, g_clt = 0, g_tps = 0, g_batt = 0, g_afr = 0;
 static int16_t  g_iacStep = 0;
 
-static void resetData() {
-    s_groupMask = 0;
-    s_groupMaskSnap = 0;
-    s_anyGroupSeen = false;
-    s_lastFrameMs = 0;
-    s_canFresh = false;
-    memset(s_outpc, 0, sizeof(s_outpc));
-}
-
 static uint8_t interpolateIac(int16_t cltF) {
     if (cltF <= kIacTempF[0]) return kIacDuty[0];
     for (uint8_t i = 1; i < 8; i++) {
@@ -233,6 +258,20 @@ static uint8_t interpolateIac(int16_t cltF) {
 static void setFan(bool on) {
     if (g_cfg.fanOut >= 1 && g_cfg.fanOut <= 7) digitalWrite(g_cfg.pin.out[g_cfg.fanOut - 1], on ? HIGH : LOW);
 }
+/* Fan output index, or 0 when there is none. inputForces() takes a target
+ * OUTPUT NUMBER (1..7), and the fan used to be written as the literal 7 while
+ * setFan() drives g_cfg.fanOut - which DEFAULTS TO 6. So `A1 F 2.5` (documented
+ * as "map this input to the fan") set g_cfg.anOut[0] = 6, and the only consumer
+ * of that mapping asked inputForces(7). The fan pin was never affected, and the
+ * `A1 fan thr=2.5V` confirmation named the mapping as if it had been.
+ *
+ * The output loop could not rescue it either: it `continue`s past (i+1) ==
+ * fanOut precisely so the fan logic owns that pin, so inputForces(6) was never
+ * consulted for O6 either. One function, so one definition - setFan() and the
+ * force lookup can no longer disagree about which pin is the fan. */
+static inline uint8_t fanOutIdx() {
+    return (g_cfg.fanOut >= 1 && g_cfg.fanOut <= 7) ? g_cfg.fanOut : 0;
+}
 // Fan run-on: after auto mode drops the fan at fanOffTemp, keep it running a
 // few extra seconds to bleed residual radiator heat -> widens the effective
 // hysteresis, slows cycling. Applies ONLY to the auto hysteresis path; manual
@@ -243,8 +282,23 @@ static void setOut(uint8_t i, bool on) { digitalWrite(g_cfg.pin.out[i], on ? HIG
 // full-open stop at ~94% PWM duty; above that it slams the stop and bounces.
 // Every duty path funnels through setIac(), so cap here once.
 static constexpr uint8_t kIacDutyMax = 93;
+/* The duty ACTUALLY commanded, in percent.
+ *
+ * Every reader used to call ledcRead(0) * 100 / 1023, which floors: a commanded
+ * 30% writes ledc 306, and 306*100/1023 = 29.9 truncates to 29. So the display,
+ * the `?` report, the 0xB0 telemetry byte and the 0xD0 snapshot all disagreed
+ * with the value setIac() was given, by 1% at every duty that is not a multiple
+ * of 4.06 - i.e. most of them. On the dash that byte is the displayed idle-air
+ * percentage, so the driver saw a number the firmware had never commanded.
+ *
+ * Keeping the commanded value is also the honest answer for a *failsafe* duty:
+ * ledcRead() reports the register, and during a link dropout the valve is
+ * deliberately held by not writing at all, so the register still holds the last
+ * commanded duty while the engine may be doing something else entirely. */
+static uint8_t g_iacDuty = 0;
 static void setIac(uint8_t duty) {
     if (duty > kIacDutyMax) duty = kIacDutyMax;
+    g_iacDuty = duty;
     ledcWrite(0, (uint32_t)duty * 1023 / 100);
 }
 
@@ -254,12 +308,51 @@ static uint16_t readAnalogMv(uint8_t i) {
     // wrapped to ~9.5k and the gauge read FULL on an open circuit. 60k keeps
     // A1-A3 (max ~40k at load dump) untouched; gasPercent's 32k filter cap
     // then maps 60k past the EMPTY anchor -> reads empty, the safe direction.
-    // Oversample x8: ESP32 ADC jitter is tens of mV per sample, so one bad
-    // reading near the threshold could out-vote the latch debounce on a
-    // floating/noisy line. 8-read mean kills it; cost is ~0.3ms/ch.
-    uint32_t sum = 0;
-    for (uint8_t k = 0; k < 8; k++) sum += analogRead(ADC_PINS[i]);
-    uint32_t mv = (uint32_t)((sum / 8.0f) * 3300.0f / 4095.0f * ADC_DIVIDER);
+    /* Oversample mean: ESP32 ADC jitter is tens of mV per sample, so one bad
+     * reading near the threshold could out-vote the latch debounce on a
+     * floating/noisy line.
+     *
+     * Oversample count is 4, not the 8 this used. Two separate reasons, and only
+     * one of them is about noise:
+     *
+     *  1. analogReadMilliVolts() is NOT one ADC conversion — it calls
+     *     esp_adc_cal_characterize() on EVERY invocation to fetch the eFuse
+     *     calibration curve, then esp_adc_cal_raw_to_voltage(). Verified in
+     *     cores/esp32/esp32-hal-adc.c: __analogReadMilliVolts() does exactly
+     *     one __analogReadRaw() plus that characterisation. So each sample here
+     *     costs a raw read PLUS a calibration lookup, where the old raw-count
+     *     version cost only the raw read.
+     *  2. This is the hottest ADC path in the firmware: updateAnalogLatch()
+     *     calls readAnalogMv() for all four channels on EVERY loop pass, and the
+     *     loop runs every ~2 ms plus work. 4 channels x 8 samples x that rate
+     *     is ~16k calibration lookups per second on a 240 MHz Xtensa, competing
+     *     with the failsafe evaluation and the actuators.
+     *
+     * Halving to 4 keeps the averaging that matters: the calibration fixes
+     * SYSTEMATIC gain/offset error, which is what the raw-count version had and
+     * what made this change worthwhile, but it does nothing for random jitter.
+     * Four samples still crushes the tens-of-mV per-sample spread the 8-read
+     * comment described, at half the per-sample cost. If jitter ever shows at a
+     * latch threshold again, raise this back — the fix is more samples here, not
+     * reverting to uncalibrated counts. */
+     /*
+     * The count version assumes the ADC's transfer function is a straight line
+     * through the origin and that full-scale really is 3300 mV. Neither holds on
+     * the ESP32: the curve is measurably non-linear at 11 dB above roughly 2.5 V,
+     * and the reference voltage varies per-chip and with temperature. The core
+     * applies the eFuse calibration for exactly this, so reading millivolts
+     * removes both errors instead of modelling them.
+     *
+     * The gain error that mattered here is not small: these are 100k/4.6k
+     * dividers measuring 12 V car signals, so the node sits near 550 mV and every
+     * error is multiplied by 22.74. A 5% reference error became a 5% error on the
+     * reported source voltage, which is what A1-A3 latch against (2000 mV
+     * default threshold) and what the gas gauge's 5 anchors are recorded in. The
+     * oversample above is kept regardless — that tames noise, which calibration
+     * does not. */
+    uint32_t sumMv = 0;
+    for (uint8_t k = 0; k < 8; k++) sumMv += analogReadMilliVolts(ADC_PINS[i]);
+    uint32_t mv = (uint32_t)((sumMv / 8.0f) * ADC_DIVIDER);
     return (uint16_t)(mv > 60000u ? 60000u : mv);
 }
 
@@ -502,13 +595,13 @@ static void applyPinConfig();
 //   0xC0 dash -> iobox3: [0xC0][len][cmd...]
 // Both devices stay on a fixed channel (1) so no AP association is required.
 // ---------------------------------------------------------------------------
-static uint8_t  s_anLatchByte = 0;
 static uint8_t  s_seq = 0;
-static uint16_t s_warnLatched = 0;   // forward decl (real def below)
 static volatile float s_speedMph = 0; // ABS speed, mph (0xB0 f[2])
 static void gasSampleMv();     // ADC read + EMA advance; ONCE per loop()
 static int  gasPctFromFilt();  // pure s_gasFilt -> percent mapping
 static void saveCfg();
+static uint8_t s_cfgShadow[sizeof(Cfg)];   // last-known-stored bytes; see saveCfg()
+static bool    s_cfgShadowValid = false;
 
 static uint32_t s_rxA0Count = 0;
 static uint32_t s_rxC0Count = 0;
@@ -615,8 +708,14 @@ static void espnowSendStatus() {
     // v3 frame: v2 (gas% + per-channel source-mV) + live IAC duty % in [14].
     // Dash reads only [1](latch) and [4](warn) with a len>=8 guard, so the
     // extra bytes are ignored by old receivers — fully backward compatible.
-    // Extended v4: +[15]=fanMode(0/1/2) +[16]=iacMode(0/1/2) +[17]=buzzerOn +[18]=reserved (was bootTestOn)
+    // Extended v4: +[15]=fanMode(0/1/2) +[16]=iacMode(0/1/2) +[17]=buzzerOn +[18]=warn high byte (v7)
     // v5: [2] (was spare 0) now carries speed mph from the ABS/LM393 input.
+    // v7: [18] was the reserved byte (formerly bootTestOn, always 0) and now
+    // carries bits 8-15 of the warning mask. W_LEAN and W_RICH are bits 8 and 9,
+    // so [4] alone could never carry them: the two mixture warnings were
+    // computed, latched, beeped and displayed on the box's own panel, and were
+    // structurally incapable of reaching the dash. A lean WOT pull past the
+    // AFR ceiling lit nothing on the driver's display.
     uint8_t f[19] = {0};
     f[0] = FRAME_STATUS;
     uint8_t latch = 0;
@@ -624,14 +723,14 @@ static void espnowSendStatus() {
     f[1] = latch;
     f[2] = (uint8_t)constrain((int)s_speedMph, 0, 255);
     f[3] = ++s_seq;
-    f[4] = (uint8_t)(s_warnLatched & 0xFF);
+    f[4] = 0;   // warn mask LOW — box no longer computes warnings (dash does)
     f[5] = (uint8_t)constrain(gasPctFromFilt(), 0, 100);
     for (uint8_t i = 0; i < 4; i++) {
         uint16_t mv = readAnalogMv(i);
         f[6 + i * 2]     = (uint8_t)(mv & 0xFF);
         f[6 + i * 2 + 1] = (uint8_t)(mv >> 8);
     }
-    f[14] = (uint8_t)((uint32_t)ledcRead(0) * 100 / 1023);
+    f[14] = g_iacDuty;
     // New mode state bytes
     uint8_t fanMode = 0;
     if (g_cfg.fanAuto) fanMode = 1;
@@ -642,7 +741,7 @@ static void espnowSendStatus() {
     else if (g_cfg.iacFollow) iacMode = 2;
     f[16] = iacMode;
     f[17] = g_cfg.buzzerEnable ? 1 : 0;
-    f[18] = 0;   // reserved (bootTest removed — kept 0 for frame layout compat)
+    f[18] = 0;  // warn mask HIGH — unused now; byte KEPT so f[19..] stay put
     esp_err_t r = esp_now_send(ESP_NOW_BROADCAST, f, sizeof(f));
     s_txB0Count++;
     if (r != ESP_OK) {
@@ -720,58 +819,9 @@ static void speedTick(uint32_t dtMs) {
     }
 }
 
-// 0xD0 reply channel for the diag module (and any future console peer).
-// Sent from loop() context immediately after a queued OTA command executes —
-// never inside the ESP-NOW RX callback. Purely additive: A0/B0 formats and
-// the outpc receive path are untouched.
-//   [D0][len][cmd...]        ack + echo of the command that just ran
-//   [D0][0x01][27B snapshot] machine-readable state, sent after a remote '?'
-static void espnowSendAck(const char* cmd) {
-    size_t n = strlen(cmd);
-    if (n > 20) n = 20;
-    uint8_t f[22] = {0};
-    f[0] = FRAME_REPLY;
-    f[1] = (uint8_t)n;
-    memcpy(&f[2], cmd, n);
-    esp_now_send(ESP_NOW_BROADCAST, f, 2 + n);
-}
-
-static void espnowSendSnapshot() {
-    // v2 snapshot: [2]=canFresh [3..16]=rpm,map,mat,clt,tps,batt,afr LE [17]=iac%
-    // [18]=flags b0 fan b1 follow b2 auto b4 buzzing b5 eng-enabled
-    // [19..20]=iacTarget [21]=O1-7 bitmask [22]=warnLatched low byte
-    // v3: +[23]=fanMode(0/1/2) +[24]=iacMode(0/1/2) +[25]=reserved (was bootTestOn) +[26]=reserved
-    uint8_t f[27] = {0};
-    auto wr16 = [&](int o, int v){ f[o] = (uint8_t)(v & 0xFF); f[o+1] = (uint8_t)((v >> 8) & 0xFF); };
-    f[0] = FRAME_REPLY; f[1] = 0x01;
-    f[2] = s_canFresh ? 1 : 0;
-    wr16(3,  (int)g_rpm); wr16(5,  (int)g_map); wr16(7,  (int)g_mat);
-    wr16(9,  (int)g_clt); wr16(11, (int)g_tps); wr16(13, (int)g_batt);
-    wr16(15, (int)g_afr);
-    f[17] = (uint8_t)((uint32_t)ledcRead(0) * 100 / 1023);
-    bool fanOn = g_cfg.fanOut >= 1 && g_cfg.fanOut <= 7 &&
-                 digitalRead(g_cfg.pin.out[g_cfg.fanOut - 1]);
-    f[18] = (uint8_t)((fanOn ? 1 : 0) | (g_cfg.iacFollow ? 2 : 0) | (g_cfg.iacAuto ? 4 : 0)
-                    | (digitalRead(g_cfg.pin.buzz) == LOW ? 16 : 0)
-                    | (g_cfg.eng.enabled ? 32 : 0));
-    wr16(19, (int)g_cfg.iacTargetRpm);
-    uint8_t outs = 0;
-    for (uint8_t i = 0; i < 7; i++) if (digitalRead(g_cfg.pin.out[i])) outs |= (1u << i);
-    f[21] = outs;
-    f[22] = (uint8_t)(s_warnLatched & 0xFF);
-    // New mode state bytes (v3)
-    uint8_t fanMode = 0;
-    if (g_cfg.fanAuto) fanMode = 1;
-    else if (g_cfg.fanManual) fanMode = 2;
-    f[23] = fanMode;
-    uint8_t iacMode = 0;
-    if (g_cfg.iacAuto) iacMode = 1;
-    else if (g_cfg.iacFollow) iacMode = 2;
-    f[24] = iacMode;
-    f[25] = 0;   // bootTest removed — reserved
-    f[26] = 0; // reserved
-    esp_now_send(ESP_NOW_BROADCAST, f, sizeof(f));
-}
+/* 0xD0 ack + 27-byte snapshot path REMOVED (espnowSendAck(),
+ * espnowSendSnapshot()). Grepped the whole workspace: nothing receives 0xD0.
+ * The only sender was this file, so every ack was broadcast into the void. */
 
 static void espnowInit() {
     WiFi.mode(WIFI_AP);
@@ -820,183 +870,9 @@ static void decodeOutpc() {
 
 // CAN-less simulation and boot self-test REMOVED (never inject synthetic ECU
 // data — the box only ever mirrors real dash 0xA0 frames).
-static uint16_t s_warnRaw = 0;
-
-/* Per-bit hold deadlines for s_warnLatched, indexed by bit position.
- *
- * There used to be ONE timer for the whole mask (s_warnFirstMs), armed when the
- * mask went non-empty, and the mask was refreshed by ASSIGNMENT:
- *
- *     s_warnLatched = s_warnRaw;            // assignment, not |=
- *
- * That silently downgrades an already-latched warning the moment a
- * lower-priority one appears. W_OVERHEAT latches at t=0; at t=500 it clears and
- * LOWBATT appears; the assignment replaces the mask in a single pass, and
- * topWarnName() resolves priority only WITHIN one mask, so the box reported
- * LOWBATT and the warn relay blinked for the wrong condition. The displaced bit
- * left no trace anywhere, so it could not be recovered afterwards.
- *
- * The single timer was the second half of the same defect. The hold was
- * anchored to the first warning of ANY kind, so the displaced warning's
- * remaining hold was lost rather than deferred, and s_warnFirstMs was not
- * rearmed — the mask then expired 2.5 s into a 3000 ms hold.
- *
- * MODEL CHOSEN: per-bit expiry. Every bit carries its own deadline and
- * s_warnLatched is OR-ed rather than assigned, so a bit still inside its own
- * hold window cannot be dropped by a lower-priority bit turning up. A global
- * hold that only OR-ed was the alternative and is not sufficient — it would
- * still let the mask be emptied as a unit (one bit's expiry retiring another
- * bit's hold), and it forces every bit to share the first warning's deadline,
- * which is precisely the coupling being removed here.
- *
- * A bit's deadline is re-anchored on every pass while that bit is RAW, so it
- * always holds the last time that specific bit was actually true. That is what
- * makes "hold" mean the same thing for every bit: warnHoldMs is measured from
- * when the condition stopped being true, not from when some unrelated
- * condition first appeared. A warning true for 30 s is shown for the full
- * warnHoldMs after it clears, instead of expiring on the same pass.
- *
- * This is a deliberate behaviour change for the long-warn case. The old single
- * timer was armed once at the first warning of any kind and never re-armed, so
- * a warning that stayed true for longer than warnHoldMs expired the instant it
- * cleared, with no hold at all. The change is limited to that: a lone warning
- * that appears and disappears still holds for warnHoldMs, and is the only case
- * where behaviour matches the old code exactly.
- *
- * Indexed across all 16 bit positions rather than a list of the ten known
- * warnings, so a bit added later is timed by construction and cannot fall
- * through as a latch that never expires. */
-static uint32_t s_warnBitMs[16] = {0};
-
-static const char* kTopWarnOrder[] = {
-    "OVERHEAT", "OVERBOOST", "OVERREV", "LOWBATT", "HIBATT",
-    "LEAN", "RICH", "HOTAIR", "IDLEHI", "IDLELO"
-};
-
-static const char* topWarnName(uint16_t raw) {
-    static const uint16_t kPrio[] = { W_OVERHEAT, W_OVERBOOST, W_OVERREV, W_LOWBATT, W_HIBATT,
-                                      W_LEAN, W_RICH, W_HOTAIR, W_IDLE_HI, W_IDLE_LO };
-    for (uint8_t i = 0; i < 10; i++) {
-        if (raw & kPrio[i]) return kTopWarnOrder[i];
-    }
-    return "";
-}
-
-/* AFR alarm-threshold window and reading-sanity window, x10 units
- * (50 = AFR 5.0). Both are named because they MUST NOT CROSS OVER, and that is
- * enforced at compile time below rather than left to a reviewer.
- *
- * The sanity floor was 100 and afrLow defaults to 100, so
- *
- *     W_RICH = afrOk && g_afr < afrLow   =   afrOk && g_afr < 100
- *     afrOk  =                          ... && g_afr >= 100
- *
- * required 100 <= afr < 100: the empty set. W_RICH could not fire at ANY AFR,
- * at the shipped default or at any other setting the operator could reach -
- * exhaustive sweep of afr = 1..250 returns zero hits. W_LEAN worked only
- * because afrHigh (165) sits well above the floor, so the "sanity" gate was
- * really just a second, tighter rich threshold wearing the wrong name.
- *
- * AFR was the ONLY field with that collision:
- *
- *     clt   floor 100   alarm 2300    clear
- *     mat   floor 0     alarm 1600    clear
- *     batt  floor 0     alarm 110     clear
- *     map   floor 0     alarm 2800    clear
- *     afr   floor 100   alarm 100     COLLISION
- *
- * AFR_OK_MIN is 30 (AFR 3.0): below the 50 floor of the `W afr` clamp, so no
- * setting the operator can reach is un-warnable, and above the ~2.0 an
- * unplugged wideband reports, so a disconnected sensor cannot pose as a rich
- * one. AFR_OK_MAX matches AFR_CLAMP_HI, which is already where the reading was
- * being cut off.
- *
- * NOTE the dash disagreed, and still does: esp32_ms_dash/main/ui.c uses a floor
- * of 90, so it could raise RICH across a 1.0-wide band (AFR 9.0-9.9) while the
- * box stayed silent - the driver got a lamp with no buzzer and no warn relay.
- * These two windows have to match; ui.c carries its own copy. */
-static constexpr int16_t AFR_CLAMP_LO = 50;    // `W afr <lo>` cannot go below this
-static constexpr int16_t AFR_CLAMP_HI = 250;
-static constexpr int16_t AFR_OK_MIN    = 30;    // reading-sanity floor
-static constexpr int16_t AFR_OK_MAX    = 250;   // reading-sanity ceiling
-static_assert(AFR_OK_MIN < AFR_CLAMP_LO,
-              "the AFR sanity floor must stay below the smallest legal afrLow; "
-              "otherwise W_RICH is un-warnable at that setting (the 100/100 bug)");
-static_assert(AFR_CLAMP_LO < AFR_CLAMP_HI, "W afr lo must be below hi");
-
-static uint16_t engineWarnFlags() {
-    uint16_t raw = 0;
-    if (!s_canFresh) return 0;
-    bool cltOk = groupSeen(2) && g_clt > 100 && g_clt < 3500;
-    bool matOk = groupSeen(2) && g_mat > 0 && g_mat < 3000;
-    /* map had no reading sanity gate at all, unlike clt/mat/afr. `g_map > 0`
-     * is the minimum: a zero or absent reading is not evidence of overboost.
-     * With no gate, a stored threshold of 0 (reachable until the W map range
-     * floor was raised) matched every positive MAP - i.e. every running
-     * engine - and latched W_OVERBOOST permanently. */
-    bool mapOk = groupSeen(2) && g_map > 0 && g_map < 4000;
-    bool onThrottle = groupSeen(3) && g_tps >= 50;
-    /* AFR was the one field whose sanity floor was NOT below its own alarm
-     * threshold: the floor was 100 and afrLow defaults to 100, so W_RICH needed
-     * 100 <= afr < 100 and could never fire. See AFR_OK_MIN above. */
-    bool afrOk = onThrottle && g_afr >= AFR_OK_MIN && g_afr <= AFR_OK_MAX;
-
-    // Partial-frame hardening: only trust a field if its group was present in
-    // the current frame. On a real 0xA0 broadcast all 9 groups arrive together,
-    // but if a frame is ever partial, g_* values from a previous frame would be
-    // stale here and could misfire a warning / mis-drive an actuator.
-    bool rpmOk = groupSeen(0);
-    bool tpsOk = groupSeen(3);
-    bool battOk = groupSeen(3);
-
-    if (rpmOk && g_rpm >= g_cfg.eng.maxRpm) raw |= W_OVERREV;
-    if (rpmOk && g_rpm > 0 && g_rpm < g_cfg.eng.idleRpmMin && tpsOk && g_tps < 200) raw |= W_IDLE_LO;
-    if (rpmOk && g_rpm > 0 && g_rpm > g_cfg.eng.idleRpmMax && tpsOk && g_tps < 200) raw |= W_IDLE_HI;
-    if (cltOk && g_clt > g_cfg.eng.cltMax) raw |= W_OVERHEAT;
-    if (matOk && g_mat > g_cfg.eng.matMax) raw |= W_HOTAIR;
-    if (battOk && g_batt > 0 && g_batt < g_cfg.eng.battMin) raw |= W_LOWBATT;
-    if (battOk && g_batt > 0 && g_batt > g_cfg.eng.battMax) raw |= W_HIBATT;
-    if (mapOk && g_map > g_cfg.eng.mapMax) raw |= W_OVERBOOST;
-    if (afrOk && g_afr > g_cfg.eng.afrHigh) raw |= W_LEAN;
-    if (afrOk && g_afr < g_cfg.eng.afrLow) raw |= W_RICH;
-    return raw;
-}
-
-static void updateEngineProfile() {
-    /* 'W 0' (eng.enabled == false) must actually silence the warning system.
-     * g_cfg.eng.enabled was read in exactly three places -- the '?' report, the
-     * 0xD0 snapshot flag, and the two setters -- and never gated
-     * engineWarnFlags(). So after W 0 every warning still computed, the buzzer
-     * still beeped, and eng.warnOut kept blinking its relay. */
-    if (!g_cfg.eng.enabled) {
-        s_warnRaw = 0;
-        s_warnLatched = 0;
-        /* stop any latch-driven buzz via updateBuzzer() below: with no
-         * latched warning and eng.enabled false it will not retrigger */
-        return;
-    }
-    s_warnRaw = engineWarnFlags();
-    uint32_t now = millis();
-
-    /* Latch OR raw: a bit that is present NOW is held. Assignment (`=`) here
-     * is what let a lower-priority warning erase a latched higher-priority one;
-     * see the note on s_warnBitMs. */
-    s_warnLatched |= s_warnRaw;
-
-    /* Re-anchor each still-present bit's own deadline, then retire only the
-     * bits that are gone AND have served their own full hold. Clearing the
-     * mask as a unit (the old `s_warnLatched = 0`) is what dropped an
-     * in-flight higher-priority hold early. */
-    for (uint8_t bit = 0; bit < 16; bit++) {
-        uint16_t m = (uint16_t)(1u << bit);
-        if (!(m & s_warnLatched)) continue;
-        if (m & s_warnRaw) {
-            s_warnBitMs[bit] = now;
-        } else if ((now - s_warnBitMs[bit]) >= g_cfg.eng.warnHoldMs) {
-            s_warnLatched &= (uint16_t)~m;
-        }
-    }
-}
+/* Engine-warning computation REMOVED from the box: engineWarnFlags(),
+ * updateEngineProfile(), s_warnRaw, s_warnLatched, s_warnBitMs[] and
+ * topWarnName() are all gone. The dash does this work already. */
 
 static uint32_t s_fanOffAtMs = 0;            /* when the fan was last commanded off */
 static bool     s_fanHeldAfterLinkLoss = false;
@@ -1096,6 +972,28 @@ static void updateOutputs() {
             // Run-on: hold a few seconds after the off trigger (auto cycling
             // only) to bleed residual heat and slow the on/off oscillation.
             if (!fanState && fanRunOnStart && (millis() - fanRunOnStart) < FAN_RUNON_MS) fanOn = true;
+        } else if (groupSeen(2)) {
+            /* CLT is present in this frame but out of the sane range, or group 2
+             * arrived with a reading the sanity window rejected. A cooling fan
+             * must FAIL ON: an unreadable coolant sensor is not evidence that
+             * the engine is cold, and treating it as one left the fan OFF for
+             * the entire fault - which is the one condition where the engine is
+             * most likely overheating.
+             *
+             * Scoped to groupSeen(2) on purpose. If group 2 is simply ABSENT
+             * from the frame there is no coolant data at all, and the fan's
+             * state is unknown rather than faulty - the link-lost hold above
+             * (fanHoldOn) is what covers that case, and it deliberately runs on
+             * the raw g_clt. Failing the fan on for every absent group would
+             * mean the fan runs whenever the dash broadcasts a partial frame,
+             * including at ignition-off.
+             *
+             * Deliberately does NOT latch: a recovered sensor returns the fan to
+             * normal hysteresis on the next pass, with no manual reset. */
+            fanAutoPrev = true;      // no stale run-on timer on recovery
+            fanRunOnStart = 0;
+            fanState = true;
+            fanOn = true;
         }
     } else {
         // Left auto mode: clear the continuity latch so re-entering auto
@@ -1110,7 +1008,12 @@ static void updateOutputs() {
     // Fires at the same fixed fanOnTemp (180F) as auto mode — the fan never
     // runs hotter than 180 nominal in any mode.
     if (cltOk && clt >= g_cfg.fanOnTemp) fanOn = true;
-    fanOn = fanOn || inputForces(7);
+    // Fan-run follow: `A<n> F <v>` maps an analog input onto g_cfg.fanOut. This
+    // was the literal 7 while fanOut DEFAULTS TO 6, and the output loop below
+    // `continue`s past fanOut so it never evaluated inputForces(6) either - the
+    // documented fan mapping did nothing at all. fanOutIdx() is the one place
+    // that decides which output is the fan.
+    fanOn = fanOn || inputForces(fanOutIdx());
     // Link-lost minimum-on hold: keep the fan driven after the ESP-NOW link
     // drops so a flapping link cannot strobe it, and so a warm engine stays
     // cooled through the dropout. Uses the raw g_clt (not the groupSeen(2)-
@@ -1118,6 +1021,14 @@ static void updateOutputs() {
     // frame did not carry coolant data.
     if (fanHoldOn) fanOn = true;
     setFan(fanOn);
+
+    /* Warn-lamp blink override REMOVED with the warning system. There is no
+     * longer anything to blink: eng.warnOut is now only layout ballast inside
+     * EngineProfile, and the output it used to seize is driven solely by its
+     * own outMode again. That output was previously UNREACHABLE through its
+     * mode - warnOut overwrote it twice a second - so this strictly widens what
+     * that pin can do. The fan's own exclusion (`i + 1 == g_cfg.fanOut`) is
+     * untouched: cooling still has the stronger claim on its pin. */
 
     for (uint8_t i = 0; i < 7; i++) {
         if ((i + 1) == g_cfg.fanOut) continue;
@@ -1136,16 +1047,10 @@ static void updateOutputs() {
             on = g_cfg.outManual[i];
         }
         /* inputForces() is honoured on BOTH paths and always was the point:
-         * A1-A3 are local car wires, not dash data. */
+         * A1-A3 are local car wires, not dash data, and a mapped input OR-ed
+         * on top of the mode state. */
         on = on || inputForces(i + 1);
         setOut(i, on);
-    }
-
-    /* Frozen warning data must not drive the warn relay at 2 Hz forever. */
-    if (linkFresh && g_cfg.eng.warnOut >= 1 && g_cfg.eng.warnOut <= 7 &&
-        g_cfg.eng.warnOut != g_cfg.fanOut && s_warnLatched) {
-        bool blink = ((millis() / 500) & 1) == 0;
-        setOut(g_cfg.eng.warnOut - 1, blink);
     }
 
     /* Link down + engine running: HOLD the valve. The correct action with no
@@ -1238,9 +1143,12 @@ static void updateBuzzer() {
     } else if (now < s_buzzTestUntilMs) {
         on = true;                   // B T test beep
     } else if (g_cfg.buzzerEnable) {
+        /* Engine warnings are gone from the box, so LOW FUEL is now the only
+         * thing the buzzer speaks for. Deliberately kept: it is a gas-gauge
+         * reading from the box's own ADC, not an echo of the ECU's warning
+         * bits, and nothing else in the car has that measurement. */
         bool lowFuel = gasPctFromFilt() <= g_cfg.lowFuelPct;
-        bool anyWarn = s_warnLatched != 0 || lowFuel;
-        on = anyWarn && ((now % 1000) < 100);
+        on = lowFuel && ((now % 1000) < 100);
     } else {
         on = false;
     }
@@ -1270,11 +1178,6 @@ static char s_lastTgt[8] = "";
 static char s_lastClt[8] = "";
 static char s_lastMode[8] = "";
 static char s_lastStat[24] = "";
-static char s_lastWarn[12] = "";
-/* Blink phase the warning text on screen was last drawn with, so a phase flip
- * can be told apart from "nothing moved". Same idea as updateGasDisplay()'s
- * s_blinkPhase. */
-static bool  s_warnBlink = false;
 
 static void drawValue(int16_t x, int16_t y, uint8_t size, uint16_t color,
                       uint16_t clearW, char* last, const char* s) {
@@ -1296,60 +1199,33 @@ static void updateDisplay() {
      * s_lastStat is already 24; drawValue needs room for the widest %s/%d too. */
     char buf[24];
 
-    uint8_t duty = (uint8_t)(ledcRead(0) * 100 / 1023);
+    uint8_t duty = g_iacDuty;
     snprintf(buf, sizeof buf, "%u%%", duty);
     drawValue(48, 48, 6, GC9A01A_CYAN, 144, s_lastDuty, buf);
 
-    snprintf(buf, sizeof buf, "%u", s_canFresh ? g_rpm : 0);
+    /* %lu + cast: g_rpm is uint32_t, which is not `unsigned int` on every target
+     * this compiles for, so %u is a format mismatch rather than a style nit. */
+    snprintf(buf, sizeof buf, "%lu", s_canFresh ? (unsigned long)g_rpm : 0UL);
     drawValue(40, 146, 2, s_canFresh ? GC9A01A_WHITE : GC9A01A_DARKGREY, 64, s_lastRpm, buf);
 
     snprintf(buf, sizeof buf, "%d", (int)g_cfg.iacTargetRpm);
     drawValue(108, 146, 2, GC9A01A_YELLOW, 100, s_lastTgt, buf);
 
     bool cltOk = groupSeen(2) && g_clt > 100 && g_clt < 3500;
-    snprintf(buf, sizeof buf, cltOk ? "%dF" : "--", g_clt / 10);
+    /* Explicit branches rather than snprintf() with a non-literal format.
+     * g_clt / 10 is only evaluated on the readable branch here, so a dead
+     * sensor cannot print a garbage temperature alongside the "--". */
+    if (cltOk) snprintf(buf, sizeof buf, "%dF", (int)(g_clt / 10));
+    else        snprintf(buf, sizeof buf, "--");
     drawValue(40, 184, 2, cltOk ? GC9A01A_YELLOW : GC9A01A_DARKGREY, 64, s_lastClt, buf);
 
     const char* mode = g_cfg.iacFollow ? "FOLLOW" : (g_cfg.iacAuto ? "AUTO" : "MAN");
     snprintf(buf, sizeof buf, "%s", mode);
     drawValue(108, 184, 2, GC9A01A_GREEN, 100, s_lastMode, buf);
 
-    /* A blink phase is a TIME-VARYING input and cannot ride the text
-     * change-gate: gate on `strcmp(s_lastWarn, warn)` alone and setTextColor()
-     * runs exactly once for the whole lifetime of a warning, because the mask
-     * changes only when the text does. The word was drawn in whichever colour
-     * the phase happened to be at and then froze — the 1 Hz attention blink
-     * below never actually happened on the panel. (updateOutputs() computes the
-     * same expression ungated, which is why the relay blinked but the text
-     * did not.) */
-    const char* warn = s_warnLatched ? topWarnName(s_warnLatched) : "";
-    bool phase = ((millis() / 500) & 1) == 0;
-    bool textChanged = strcmp(s_lastWarn, warn) != 0;
-    bool blinkChanged = s_warnLatched && (phase != s_warnBlink);
-    if (textChanged || blinkChanged) {
-        if (textChanged) {
-            strcpy(s_lastWarn, warn);
-            s_tft->fillRect(60, 202, 120, 10, GC9A01A_BLACK);
-        }
-        if (s_warnLatched) {
-            /* Re-colouring deliberately skips the fillRect. The string, the
-             * cursor and the text size are all identical to the previous draw,
-             * so the glyph covers the same pixels — and Adafruit_GFX::drawChar
-             * writes ONLY the glyph's set pixels here, because the one-arg
-             * setTextColor() above sets textbgcolor = textcolor, which makes
-             * drawChar's `else if (bg != color)` false. Every pixel the last
-             * pass touched is therefore overwritten by this one, and skipping
-             * the rectangle keeps a blink flip to a few dozen setPixel calls
-             * instead of a 120x10 fill. The fillRect is required on the
-             * textChanged path only, where a shorter or differently shaped
-             * string would otherwise leave the old glyph's pixels behind. */
-            s_tft->setCursor((240 - (int)strlen(warn) * 6) / 2, 202);
-            s_tft->setTextSize(1);
-            s_tft->setTextColor(phase ? GC9A01A_RED : GC9A01A_DARKGREY);
-            s_tft->print(warn);
-        }
-        s_warnBlink = phase;
-    }
+    /* On-screen warning text REMOVED with the warning system. This box's own
+     * TFT never showed an engine warning the driver could act on anyway - the
+     * gauge cluster is the display for that, and it computes its own. */
 
     uint16_t sc;
     if (!s_canFresh) {
@@ -1941,8 +1817,7 @@ static void initTft() {
         if (s_tft == nullptr) {
             // PINS SWAPPED: idle renderer now drives the screen on the gas-CS/DC
             // (CS2/DC21). Gas renderer took over the idle CS17/DC18 in initGasTft().
-            s_tft = new Adafruit_GC9A01A(GAS_CS, GAS_DC,
-                                         g_cfg.pin.tftMosi, g_cfg.pin.tftSclk, -1);
+            s_tft = new Adafruit_GC9A01A(GAS_CS, GAS_DC, g_cfg.pin.tftMosi, g_cfg.pin.tftSclk, -1);
         }
         s_tft->begin();
         s_tft->setRotation(1);   // content upright when screen mounted pins-right
@@ -1954,7 +1829,7 @@ static void initTft() {
          * saved ~180 ms of a 1.3 s stall. */
         drawGaugeFrame();
         s_lastDuty[0] = s_lastRpm[0] = s_lastTgt[0] = s_lastClt[0] = 0;
-        s_lastMode[0] = s_lastStat[0] = s_lastWarn[0] = 0;
+        s_lastMode[0] = s_lastStat[0] = 0;
     }
 }
 
@@ -2024,14 +1899,12 @@ static void tftIdleAlloc() {
     if (s_tft == nullptr) {
         // PINS SWAPPED: idle renderer drives the gas-CS/DC (CS2/DC21); the gas
         // renderer takes the idle CS17/DC18.
-        s_tft = new Adafruit_GC9A01A(GAS_CS, GAS_DC,
-                                     g_cfg.pin.tftMosi, g_cfg.pin.tftSclk, -1);
+        s_tft = new Adafruit_GC9A01A(GAS_CS, GAS_DC, g_cfg.pin.tftMosi, g_cfg.pin.tftSclk, -1);
     }
 }
 static void tftGasAlloc() {
     if (s_gasTft == nullptr) {
-        s_gasTft = new Adafruit_GC9A01A(g_cfg.pin.tftCs, g_cfg.pin.tftDc,
-                                        GAS_MOSI, GAS_SCLK, -1);
+        s_gasTft = new Adafruit_GC9A01A(g_cfg.pin.tftCs, g_cfg.pin.tftDc, GAS_MOSI, GAS_SCLK, -1);
     }
 }
 
@@ -2088,7 +1961,7 @@ static void tftReinitStep() {
         case TFT_STEP_IDLE_FRAME:                    // ~180 ms
             drawGaugeFrame();
             s_lastDuty[0] = s_lastRpm[0] = s_lastTgt[0] = s_lastClt[0] = 0;
-            s_lastMode[0] = s_lastStat[0] = s_lastWarn[0] = 0;
+            s_lastMode[0] = s_lastStat[0] = 0;
             s_tftStep = TFT_STEP_GAS_ALLOC;
             return;
         case TFT_STEP_GAS_ALLOC:
@@ -2109,8 +1982,39 @@ static void tftReinitStep() {
     }
 }
 
+/* Persist g_cfg, but ONLY if it differs from what is already stored.
+ *
+ * saveCfg() is called from every arm of handleCommand(), and many of those arms
+ * already compare-before-write (F, I, T, S, O, A, Q). This is the backstop for
+ * the ones that do not, and it matters more than the byte count suggests: NVS
+ * putBytes on an unchanged value still erases and rewrites a flash sector, so a
+ * command that changes nothing is not free — it is flash wear. On the ESP-NOW
+ * command path that cost is reachable from off-car by anyone in radio range,
+ * because `P WIPE`/`P DASH`/`Y` were refused but the accepted keys (F, I, T, Q,
+ * B, L) are not.
+ *
+ * memcmp against a RAM shadow of the last-written bytes, not against a re-read
+ * from NVS: re-reading costs the same erase-class operation this is trying to
+ * avoid on some partitions, and the shadow is initialised by the same code path
+ * that writes, so it cannot disagree with the blob.
+ *
+ * Also reports failure. putBytes returns size_t (0 on error) and the old code
+ * discarded it, so a full or read-only namespace produced a command that printed
+ * "updated" and a setting that was not stored — the same
+ * appears-to-have-worked class the other fixes in this file closed. */
 static void saveCfg() {
-    g_prefs.putBytes("cfg", &g_cfg, sizeof(g_cfg));
+    if (s_cfgShadowValid && memcmp(&g_cfg, s_cfgShadow, sizeof(g_cfg)) == 0) return;
+    if (!s_nvsOk) return;                       // nothing could be stored anyway
+    size_t n = g_prefs.putBytes("cfg", &g_cfg, sizeof(g_cfg));
+    if (n == sizeof(g_cfg)) {
+        memcpy(s_cfgShadow, &g_cfg, sizeof(g_cfg));
+        s_cfgShadowValid = true;
+    } else {
+        /* Deliberately NOT marking the shadow valid: the next command must
+         * retry rather than assume this landed. */
+        Serial.printf("cfg: SAVE FAILED (wrote %u of %u bytes) — settings NOT stored.\n",
+                      (unsigned)n, (unsigned)sizeof(g_cfg));
+    }
 }
 
 static void loadCfg() {
@@ -2152,13 +2056,21 @@ static void loadCfg() {
     // Fan temps are now FIXED (command removed) — always authoritative.
     g_cfg.fanOnTemp = 1800;
     g_cfg.fanOffTemp = 1700;
+    // Seed saveCfg()'s shadow from the blob that was just accepted (or from the
+    // defaults it just wrote), so the first command after boot is compared
+    // against what is genuinely stored instead of always writing once. The
+    // fanOnTemp/fanOffTemp assignment above means the shadow is seeded AFTER
+    // it, so a legacy blob whose stored temps differ is correctly seen as
+    // changed and re-persisted rather than diverging silently.
+    memcpy(s_cfgShadow, &g_cfg, sizeof(g_cfg));
+    s_cfgShadowValid = true;
 }
 
 static void reportStatus() {
-    Serial.printf("link=espnow rx_a0=%lu rx_c0=%lu tx_b0=%lu dropped=%lu can_fresh=%d rpm=%u map=%.1f mat=%.1fF clt=%.1fF tps=%.1f%% batt=%.1fV afr=%.1f buz=%d\n",
+    Serial.printf("link=espnow rx_a0=%lu rx_c0=%lu tx_b0=%lu dropped=%lu can_fresh=%d rpm=%lu map=%.1f mat=%.1fF clt=%.1fF tps=%.1f%% batt=%.1fV afr=%.1f buz=%d\n",
                   (unsigned long)s_rxA0Count, (unsigned long)s_rxC0Count, (unsigned long)s_txB0Count,
                   (unsigned long)s_rxDroppedCount,
-                  s_canFresh ? 1 : 0, g_rpm,
+                  s_canFresh ? 1 : 0, (unsigned long)g_rpm,
                   g_map / 10.0f, g_mat / 10.0f, g_clt / 10.0f,
                   g_tps / 10.0f, g_batt / 10.0f, g_afr / 10.0f,
                   g_cfg.buzzerEnable ? 1 : 0);
@@ -2171,7 +2083,7 @@ static void reportStatus() {
     Serial.printf("fan=%d fanon=%.1fF fanoff=%.1fF fanout=%d", g_cfg.fanOut >= 1 && g_cfg.fanOut <= 7 && digitalRead(g_cfg.pin.out[g_cfg.fanOut - 1]) ? 1 : 0,
                   g_cfg.fanOnTemp / 10.0f, g_cfg.fanOffTemp / 10.0f, g_cfg.fanOut);
     Serial.printf(" iac=%s duty=%d", g_cfg.iacFollow ? "follow" : (g_cfg.iacAuto ? "auto" : "manual"),
-                  (uint8_t)(ledcRead(0) * 100 / 1023));
+                  g_iacDuty);
     if (!g_cfg.iacFollow && !g_cfg.iacAuto) Serial.printf(" man=%d", g_cfg.iacManualDuty);
     Serial.printf(" tgt=%d", g_cfg.iacTargetRpm);
     if (g_cfg.iacFollow) Serial.printf(" iacstep=%d", g_iacStep);
@@ -2187,18 +2099,7 @@ static void reportStatus() {
     Serial.printf("\nlat=%d%d%d%d\n",
                   s_anLatch[0] ? 1 : 0, s_anLatch[1] ? 1 : 0,
                   s_anLatch[2] ? 1 : 0, s_anLatch[3] ? 1 : 0);
-    if (g_cfg.eng.enabled) {
-        const char* w = topWarnName(s_warnLatched);
-        Serial.printf("eng=on idle[%d-%d] maxrpm=%d clt<=%dF mat<=%dF batt[%d-%d]V map<=%dkPa afr lean>%d rich<%d warnout=%u hold=%ums warn=%s\n",
-                      g_cfg.eng.idleRpmMin, g_cfg.eng.idleRpmMax, g_cfg.eng.maxRpm,
-                      g_cfg.eng.cltMax / 10, g_cfg.eng.matMax / 10,
-                      g_cfg.eng.battMin / 10, g_cfg.eng.battMax / 10,
-                      g_cfg.eng.mapMax / 10, g_cfg.eng.afrHigh / 10, g_cfg.eng.afrLow / 10,
-                      g_cfg.eng.warnOut, g_cfg.eng.warnHoldMs,
-                      s_warnLatched ? w : "none");
-    } else {
-        Serial.printf("eng=off\n");
-    }
+    /* The 'eng=' report line is gone with the warning system. */
 }
 
 /* True while a command came in over the unauthenticated ESP-NOW 0xC0 channel
@@ -2244,6 +2145,9 @@ static bool cmdAllowedFromLink(char key, const String& val) {
     switch (key) {
         // F A|1|0   fan auto / manual on / manual off
         // I F|A|<d> IAC follow MS / closed loop / manual duty
+        // I B <d>   IAC fail-safe duty (ECU link down, engine stopped). Legal
+        //            from the air like the rest of I: 0 is a valid value here
+        //            because this is the operator's own idle, not a kill.
         // T <rpm>   closed-loop idle target
         case 'F':
         case 'I':
@@ -3071,6 +2975,15 @@ static void handleCommand(const String& line) {
                  * did not happen, rather than being handed a silent no-op that
                  * looks like a success. */
                 const bool wipeOk = g_prefs.clear();
+                /* The namespace is GONE now, so the shadow describes a blob that
+                 * no longer exists. Left valid, the saveCfg() three lines below
+                 * memcmp'd g_cfg against it, found the defaults equal (a box
+                 * already running on defaults always is), and returned without
+                 * writing anything — so the wipe left NO cfg key at all and the
+                 * next boot reported "no stored config - first boot" for a box
+                 * that had been explicitly factory-reset. Invalidate first: the
+                 * following saveCfg() must write unconditionally. */
+                s_cfgShadowValid = false;
                 g_cfg = Cfg{};
                 memcpy(g_cfg.gasCalMv, kGasStockMv, sizeof(g_cfg.gasCalMv));
                 saveCfg();
@@ -3233,199 +3146,18 @@ static void handleCommand(const String& line) {
             Serial.println("pin map updated (tft re-init queued)");
             break;
         }
-        case 'W': {
-            if (val == "0") { g_cfg.eng.enabled = false; saveCfg(); break; }
-            if (val == "1") { g_cfg.eng.enabled = true; saveCfg(); break; }
-            int sp = val.indexOf(' ');
-            String k = sp > 0 ? val.substring(0, sp) : val;
-            String v = sp > 0 ? val.substring(sp + 1) : "";
-            v.trim();
-            int a = v.indexOf(' ');
-            String p1 = a > 0 ? v.substring(0, a) : v;
-            String p2 = a > 0 ? v.substring(a + 1) : "";
-            p2.trim();
-
-            /* H6 - every numeric argument is validated as a STRING before it is
-             * parsed, and no field is written until every argument of the
-             * sub-command has passed.
-             *
-             * String::toFloat() is atof() and String::toInt() is atol(). atof
-             * accepts "nan", "inf" and a leading numeric prefix of anything
-             * ("212abc" -> 212.0); atol returns 0 for anything that is not a
-             * number at all. So a malformed argument used to reach g_cfg as a
-             * silently clamped, saveCfg()-persisted threshold instead of a
-             * refusal. Every one of these fields is then compared against a
-             * LIVE sensor reading in engineWarnFlags(), and a threshold that
-             * landed at the wrong end of its range does not just read wrong, it
-             * latches. Taking this car's real readings (g_* all in tenths) and
-             * running the stored threshold back through engineWarnFlags():
-             *
-             *   W clt nan      -> 100.0 F. cltOk holds (107-126 F is in range),
-             *                     so 107 > 100 => W_OVERHEAT, CONTINUOUSLY:
-             *                     buzzer every second, warn relay blinking,
-             *                     and saveCfg() makes it survive a power cycle.
-             *   W mat nan      ->  50.0 F => 107 >  50 => W_HOTAIR, continuously.
-             *   W map nan      ->   0.0 kPa. At the time of this audit this
-             *                     check had no sanity gate at all, so 98 > 0 =>
-             *                     W_OVERBOOST, continuously. Two later fixes
-             *                     closed that: `mapOk` now exists, and the W map
-             *                     range floor was raised from 0 to 1000, because
-             *                     a well-formed `W map 0` reached it regardless
-             *                     and idle MAP is already 30-100 kPa.
-             *   W batt nan nan ->   5.0 V, which is UNDER a resting battery, so
-             *                     it is an OVER-voltage reading: 126 > 50 =>
-             *                     W_HIBATT, continuously.
-             *   W afr nan nan  ->   5.0 AFR => 130 > 50 => W_LEAN, continuously.
-             *   W maxrpm junk  -> atol's 0 clamped to 1000 rpm => 4200 >= 1000
-             *                     => W_OVERREV at cruise.
-             *   W idle junk junk -> 300/300 rpm => 900 > 300 with TPS under 20%
-             *                     => W_IDLE_HI at cruise, and W_IDLE_LO becomes
-             *                     unreachable.
-             *   W warnout junk -> 0, and the lamp is gated on warnOut >= 1, so
-             *                     the check-engine output silently dies.
-             *   W hold junk    -> 0, silently killing the latch hold.
-             *
-             * So NONE of these nine is safe by accident: five fail through
-             * atof's NaN and four through atol's 0, and they were all fixed
-             * the same way rather than leaving the integer ones because they
-             * looked lower-risk.
-             *
-             * "inf" is rejected as well, deliberately. (int) of it is undefined
-             * behaviour too; on Xtensa it happens to land on the range maximum
-             * so it was harmless in practice, but that is luck rather than
-             * intent and one rule is easier to keep right than two.
-             *
-             * The string test cannot be replaced by a test on the parsed
-             * result. A result check cannot tell "the operator typed 0" from
-             * "the operator typed rubbish", and a NaN result is not
-             * distinguishable from a real reading at all. isfinite() on the
-             * result is kept as well, because the grammar below still admits an
-             * arbitrarily long digit run and atof() of that is +inf. */
-            auto argIsNum = [](const String& s) -> bool {
-                if (s.length() == 0) return false;
-                bool digit = false, dot = false;
-                for (unsigned i = 0; i < s.length(); i++) {
-                    char c = s[i];
-                    if ((c == '-' || c == '+') && i == 0) continue;   /* sign, position 0 only */
-                    if (c == '.') {
-                        if (dot) return false;
-                        dot = true;
-                    } else if (c < '0' || c > '9') {
-                        return false;   /* letters, "nan", "inf", whitespace */
-                    } else {
-                        digit = true;
-                    }
-                }
-                return digit;           /* rejects "", "+", "-", "." */
-            };
-            /* Same arithmetic as the pre-H6 expression (toFloat() * 10.0f, then
-             * truncate toward zero, then constrain), but the clamp happens in
-             * float BEFORE the int cast. That cast was the undefined step:
-             * atof can hand back a finite float far outside any of these
-             * ranges, and (int) of that is UB on Xtensa. Once clamped, t is
-             * inside [lo,hi] and the cast is defined. */
-            auto num10 = [&argIsNum](const String& s, int lo, int hi, int& out) -> bool {
-                if (!argIsNum(s)) return false;
-                float f = s.toFloat();
-                if (!isfinite(f)) return false;
-                float t = f * 10.0f;
-                if (t < (float)lo) t = (float)lo;
-                if (t > (float)hi) t = (float)hi;
-                out = (int)t;
-                return true;
-            };
-            /* A refusal must be VISIBLE and INERT. Every reject below breaks
-             * out of this case, which skips both the field assignments and the
-             * saveCfg() at the bottom, so a refused argument leaves the running
-             * profile and the stored profile exactly as they were. */
-            auto reject = [](const String& key, const String& arg) {
-                Serial.print("W ");
-                Serial.print(key);
-                Serial.print(": '");
-                Serial.print(arg);
-                Serial.println("' is not a number - eng profile unchanged");
-            };
-
-            if (k == "idle" && a > 0) {
-                if (!argIsInt(p1)) { reject(k, p1); break; }
-                if (!argIsInt(p2)) { reject(k, p2); break; }
-                int mn = constrain(p1.toInt(), 300, 3000);
-                int mx = constrain(p2.toInt(), 300, 3000);
-                if (mx < mn) { int t = mn; mn = mx; mx = t; }
-                g_cfg.eng.idleRpmMin = (int16_t)mn;
-                g_cfg.eng.idleRpmMax = (int16_t)mx;
-            } else if (k == "maxrpm" && p1.length() > 0) {
-                if (!argIsInt(p1)) { reject(k, p1); break; }
-                g_cfg.eng.maxRpm = (int16_t)constrain(p1.toInt(), 1000, 20000);
-            } else if (k == "clt" && p1.length() > 0) {
-                int t;
-                if (!num10(p1, 1000, 3000, t)) { reject(k, p1); break; }
-                g_cfg.eng.cltMax = (int16_t)t;
-            } else if (k == "mat" && p1.length() > 0) {
-                int t;
-                if (!num10(p1, 500, 2500, t)) { reject(k, p1); break; }
-                g_cfg.eng.matMax = (int16_t)t;
-            } else if (k == "batt" && a > 0) {
-                int mn, mx;
-                if (!num10(p1, 50, 200, mn)) { reject(k, p1); break; }
-                if (!num10(p2, 50, 200, mx)) { reject(k, p2); break; }
-                if (mx < mn) { int t = mn; mn = mx; mx = t; }
-                g_cfg.eng.battMin = (int16_t)mn;
-                g_cfg.eng.battMax = (int16_t)mx;
-            } else if (k == "map" && p1.length() > 0) {
-                int t;
-                /* Floor 1000 = 100 kPa, and it is not arbitrary. MAP at idle is
-                 * already ~30-100 kPa (300-1000 in the x10 units this channel
-                 * uses), so ANY threshold below that is exceeded the moment the
-                 * engine starts and latches W_OVERBOOST permanently - buzzer
-                 * every second, warn relay blinking, threshold persisted.
-                 *
-                 * `map` was the only one of the nine numeric W sub-commands
-                 * whose range floor was 0. clt floors at 1000, mat at 500, afr
-                 * at 50, batt at 50, maxrpm at 1000. A zero floor there is not
-                 * "permissive", it is a value that cannot mean anything, and it
-                 * was reachable with a perfectly well-formed argument - the
-                 * malformed-input validation added in 8b93a28 could not catch
-                 * it because `0` is a number.
-                 *
-                 * Ceiling 4000 = 400 kPa, unchanged: well above the 165 kPa
-                 * boost target this engine is aiming at.
-                 *
-                 * Note num10() CLAMPS an out-of-range number to the bound
-                 * rather than refusing it, so `W map 0` now lands on 100 kPa
-                 * instead of being rejected. That is the same `constrain()`
-                 * behaviour the other sub-commands have always had, and it is
-                 * what makes this safe: the stored value cannot be 0 whatever
-                 * is typed. */
-                if (!num10(p1, 1000, 4000, t)) { reject(k, p1); break; }
-                g_cfg.eng.mapMax = (int16_t)t;
-            } else if (k == "afr" && a > 0) {
-                int lo, hi;
-                if (!num10(p1, AFR_CLAMP_LO, AFR_CLAMP_HI, lo)) { reject(k, p1); break; }
-                if (!num10(p2, AFR_CLAMP_LO, AFR_CLAMP_HI, hi)) { reject(k, p2); break; }
-                if (hi < lo) { int t = lo; lo = hi; hi = t; }
-                g_cfg.eng.afrLow = (int16_t)lo;
-                g_cfg.eng.afrHigh = (int16_t)hi;
-            } else if (k == "hold" && p1.length() > 0) {
-                if (!argIsInt(p1)) { reject(k, p1); break; }
-                g_cfg.eng.warnHoldMs = (uint16_t)constrain(p1.toInt(), 0, 60000);
-            } else if (k == "warnout" && p1.length() > 0) {
-                if (!argIsInt(p1)) { reject(k, p1); break; }
-                g_cfg.eng.warnOut = (uint8_t)constrain(p1.toInt(), 0, 7);
-            } else if (k == "help") {
-                Serial.println("W[0|1] | W idle <min> <max> | W maxrpm <rpm> | W clt <F> | W mat <F> | W batt <min> <max> | W map <kPa> | W afr <min> <max> | W hold <ms> | W warnout <0-7>");
-                break;
-            } else {
-                Serial.println("W[0|1] | W idle <min> <max> | W maxrpm <rpm> | W clt <F> | W mat <F> | W batt <min> <max> | W map <kPa> | W afr <min> <max> | W hold <ms> | W warnout <0-7>");
-                break;
-            }
-            saveCfg();
-            Serial.println("eng profile updated");
+        case 'W':
+            /* Engine-warning thresholds REMOVED from the box. `W` is answered
+             * rather than ignored: a command that parses and does nothing is the
+             * exact defect the E/F arms had (they advertised in the help text
+             * but had no case, so typing them failed silently). Whatever scripts
+             * or habits exist around `W clt 220` get told plainly. */
+            Serial.println("W: removed - the box no longer computes engine warnings");
+            Serial.println("  the dash displays them; configure on the dash instead");
             break;
-        }
         case 'B':
             // B        -> report buzzer state
-            // B 0|1    -> disable/enable warning buzzer
+            // B 0|1    -> disable/enable the buzzer (now low-fuel only)
             // B T      -> one 100ms test beep now
             if (val == "0") { g_cfg.buzzerEnable = false; s_buzzLoop = false; saveCfg(); Serial.println("buzzer=off"); }
             else if (val == "1") { g_cfg.buzzerEnable = true; s_buzzLoop = false; saveCfg(); Serial.println("buzzer=on"); }
@@ -3501,7 +3233,7 @@ static void handleCommand(const String& line) {
             else Serial.println("X0=pullup-hiz X1=float X2=3v3 X3=gnd(beep) X9=auto");
             break;
         default:
-            Serial.println("commands: ? | M | P[IAC <pin>|O<n> <pin>|TFTS/TFTM/TFTC/TFTD <pin>|BZ <pin>|TFT 0|1|RESET|WIPE] | Q[F|E <mv>|M <mpg>|T <gal>] | F[onTempF|A|1|0] | E[offTempF] | I[duty|A|F] | T[targetRpm] | Y[fanOut 1-7|0] | S[shiftRpm] | O<n>[0|1|T<f>|R<rpm>] | A<n>[0|H<v>|L<v>|O<k> <v>|F <v>|<v>] | R | W[0|1|idle|maxrpm|clt|mat|batt|map|afr|hold|warnout|help] | B[0|1|T]");
+            Serial.println("commands: ? | M | P[IAC <pin>|O<n> <pin>|TFTS/TFTM/TFTC/TFTD <pin>|BZ <pin>|TFT 0|1|RESET|WIPE] | Q[F|E <mv>|M <mpg>|T <gal>] | F[A|1|0] | I[duty|A|F] | T[targetRpm] | Y[fanOut 1-7|0] | S[shiftRpm] | O<n>[0|1|T<f>|R<rpm>] | A<n>[0|H<v>|L<v>|O<k> <v>|F <v>|<v>] | R | W:removed | B[0|1|T]");
             break;
     }
 }
@@ -3841,6 +3573,27 @@ void setup() {
         Serial.println("      Check free flash and that the NVS partition exists.");
     }
     loadCfg();
+
+    /* Drive the actuator pads NOW, immediately after the pin map is known and
+     * before anything slow.
+     *
+     * applyPinConfig() was called further down, after gasHistoryLoad() (an NVS
+     * read), gasHistoryRescore() (a possible NVS WRITE), three more NVS loads
+     * and a queue create. Every one of those runs while the seven output pins
+     * and the IAC gate are still in their post-reset state — INPUT, no pull,
+     * floating. The pin map is the only thing applyPinConfig() needs, and
+     * loadCfg() has just supplied it, so there is nothing to be gained by
+     * waiting and a real floating window to lose. This is a boot-only
+     * correctness/EMI point: initTft()/initGasTft() below are ~1 s of software
+     * SPI, and the outputs are already parked LOW long before them.
+     *
+     * GPIO14 (O3, a strapping-adjacent output with no external pulldown on the
+     * v3 board) is the one that visibly misbehaves here — it can pulse during
+     * the float window. Firmware can bound that window; it cannot eliminate it,
+     * because between reset and this line the GPIO matrix is still coming up.
+     * A 10k pulldown to GND on that pin is the fix for the remainder. */
+    applyPinConfig();
+
     gasHistoryLoad();
     // Re-score the log's percentages against the table that was actually loaded.
     // Normally a no-op (they were scored against this same table when written),
@@ -3857,7 +3610,9 @@ void setup() {
     // 0xC0 command queue: espnowRecv only enqueues; loop() drains+executes.
     s_cmdQ = xQueueCreate(CMD_Q_SLOTS, CMD_Q_LEN);
 
-    applyPinConfig();
+    // Pins are already applied immediately after loadCfg() above — deliberately,
+    // so the outputs are not floating across the NVS loads.
+
     initTft();
     initGasTft();
 
@@ -3907,7 +3662,6 @@ void loop() {
         gasSampleMv();
     }
     updateAnalogLatch();
-    updateEngineProfile();
     updateOutputs();
     updateBuzzer();
 
@@ -3960,9 +3714,6 @@ void loop() {
             s_cmdFromLink = true;      // UART-only commands must be refused here
             handleCommand(String(cmd));
             s_cmdFromLink = false;
-            // Diag reply channel: ack every OTA command; full state after '?'.
-            espnowSendAck(cmd);
-            if (!strcmp(cmd, "?")) espnowSendSnapshot();
         }
     }
 
@@ -3993,7 +3744,12 @@ void loop() {
                 // then "W 0", then \n, ran "W 0" and disarmed the warning system.
                 // Discarding the prefix but keeping the suffix is not "dropping
                 // the flood", so this flags the line bad and keeps it bad.
-                else if (line.length() >= 128) { line = ""; badLine = true; }
+                //
+                // 64, not 128: the longest command this file accepts is the
+                // default help string's neighbours - `P`/`W`/`A` forms are all
+                // well under 30 chars - so 128 was double what anything needs,
+                // and the cap exists to bound a flood, not to accommodate one.
+                else if (line.length() >= 64) { line = ""; badLine = true; }
                 else line += ch;
             }
         }
