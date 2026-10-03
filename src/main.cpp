@@ -277,6 +277,11 @@ static inline uint8_t fanOutIdx() {
 // hysteresis, slows cycling. Applies ONLY to the auto hysteresis path; manual
 // off and the overheat/failsafe paths stay instant (see updateOutputs).
 static constexpr uint32_t FAN_RUNON_MS = 5000;
+/* Link-loss cooling hold, used ONLY when the engine was still turning over at
+ * the moment the link dropped. See updateOutputs(). 2 min is an arbitrary but
+ * generous ceiling: it is not meant to be reached, it is a backstop so a long
+ * drive with a dead radio can't leave the engine with no cooling at all. */
+static constexpr uint32_t FAN_LINKLOSS_HOLD_MS = 120000;
 static void setOut(uint8_t i, bool on) { digitalWrite(g_cfg.pin.out[i], on ? HIGH : LOW); }
 // Measured on the bench (2026-08-22): rotary ISC rotor reaches its mechanical
 // full-open stop at ~94% PWM duty; above that it slams the stop and bounces.
@@ -880,6 +885,12 @@ static void decodeOutpc() {
 
 static uint32_t s_fanOffAtMs = 0;            /* when the fan was last commanded off */
 static bool     s_fanHeldAfterLinkLoss = false;
+/* Engine state LATCHED at the instant the link dropped, not read live. g_rpm
+ * freezes with the last decoded frame, so by the time we act on it the engine
+ * may already have been shut off — but we cannot tell, because the data that
+ * would tell us stopped arriving. The last known rpm is the only evidence there
+ * is, and it is evidence of what the engine was doing when we still had eyes. */
+static bool     s_fanLinkLossRunning = false;
 
 static void updateOutputs() {
     /* Link-lost failsafe.
@@ -929,8 +940,42 @@ static void updateOutputs() {
     bool fanHoldOn    = false;   /* minimum-on hold while the link is down */
 
     if (!linkFresh) {
-        if (!s_fanHeldAfterLinkLoss) { s_fanHeldAfterLinkLoss = true; s_fanOffAtMs = millis(); }
+        if (!s_fanHeldAfterLinkLoss) {
+            s_fanHeldAfterLinkLoss = true;
+            s_fanOffAtMs = millis();
+            /* Latch rpm NOW, while group 0 is still the last real frame. */
+            s_fanLinkLossRunning = engineRunning;
+        }
         bool withinRunOn = (millis() - s_fanOffAtMs) < FAN_RUNON_MS;
+
+        /* Hold cooling for as long as the engine was running when the link
+         * dropped, not just the 5 s run-on.
+         *
+         * The 5 s run-on exists to bleed residual radiator heat after the fan
+         * switches off — it assumes the engine is going with it. On a link loss
+         * that assumption is wrong twice over: the fan is the ONLY cooling left,
+         * and the engine may well still be running. Five seconds after a radio
+         * dropout at 165 °F, the fan would stop and nothing could switch it back
+         * on, because the data that would have said "190 °F now" is exactly what
+         * stopped arriving. That is the one failure mode with no recovery path.
+         *
+         * Why rpm and not a blind longer timer: key off, ECU stops broadcasting,
+         * last frame said 165 °F. With a fixed 2 min hold the fan would run for
+         * two minutes after every shutdown, on a cold engine, for no reason.
+         * g_rpm > 300 at the moment of loss separates "still turning over" from
+         * "parked", so a key-off keeps the plain 5 s run-on and only a genuine
+         * mid-drive dropout gets the long hold.
+         *
+         * The cost: after an ignition-off dropout the fan keeps running up to
+         * 2 min. It is a fan — cheap, and the alternative is an engine with no
+         * air. It also self-clears, since this whole branch is linkFresh-gated.
+         *
+         * Note cltHotForFail below is a SEPARATE and stronger term: a last-known
+         * coolant above fanOnTemp already holds the fan on with no timeout at
+         * all, running or not. This change covers the case that one cannot see,
+         * where the engine was last known COOL and then kept heating. */
+        bool holdWhileRunning = s_fanLinkLossRunning &&
+                                (millis() - s_fanOffAtMs) < FAN_LINKLOSS_HOLD_MS;
 
         /* Cooling on link loss must not depend on the group-seen flag: a frame
          * that omitted group 2 must not be able to switch the fan off when the
@@ -943,9 +988,10 @@ static void updateOutputs() {
          * only to feed it. GCC -Wall confirms it was never read. Removed.) */
         bool cltHotForFail = (g_clt > 100 && g_clt < 3500 && g_clt >= g_cfg.fanOnTemp);
 
-        fanHoldOn = cltHotForFail || withinRunOn;
+        fanHoldOn = cltHotForFail || withinRunOn || holdWhileRunning;
     } else {
         s_fanHeldAfterLinkLoss = false;
+        s_fanLinkLossRunning = false;
     }
 
     int16_t clt = g_clt;
