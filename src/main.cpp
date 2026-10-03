@@ -312,29 +312,30 @@ static uint16_t readAnalogMv(uint8_t i) {
      * reading near the threshold could out-vote the latch debounce on a
      * floating/noisy line.
      *
-     * Oversample count is 4, not the 8 this used. Two separate reasons, and only
-     * one of them is about noise:
+     * Oversample count is 8. A previous revision of this comment block
+     * described the count as 4 and carried a full justification for dropping it
+     * from 8 ("halving to 4 keeps the averaging that matters", "4 channels x 8
+     * samples ... ~16k calibration lookups per second"). The code went back to
+     * 8 and the argument stayed behind, so the file asserted a sample count that
+     * the loop below contradicted - and the count is the one thing here anyone
+     * is likely to trust the prose over. Only the cost half of that argument is
+     * worth keeping:
      *
-     *  1. analogReadMilliVolts() is NOT one ADC conversion — it calls
-     *     esp_adc_cal_characterize() on EVERY invocation to fetch the eFuse
-     *     calibration curve, then esp_adc_cal_raw_to_voltage(). Verified in
-     *     cores/esp32/esp32-hal-adc.c: __analogReadMilliVolts() does exactly
-     *     one __analogReadRaw() plus that characterisation. So each sample here
-     *     costs a raw read PLUS a calibration lookup, where the old raw-count
-     *     version cost only the raw read.
-     *  2. This is the hottest ADC path in the firmware: updateAnalogLatch()
-     *     calls readAnalogMv() for all four channels on EVERY loop pass, and the
-     *     loop runs every ~2 ms plus work. 4 channels x 8 samples x that rate
-     *     is ~16k calibration lookups per second on a 240 MHz Xtensa, competing
-     *     with the failsafe evaluation and the actuators.
+     * analogReadMilliVolts() is NOT one ADC conversion - it calls
+     * esp_adc_cal_characterize() on EVERY invocation to fetch the eFuse
+     * calibration curve, then esp_adc_cal_raw_to_voltage(). Verified in
+     * cores/esp32/esp32-hal-adc.c: __analogReadMilliVolts() does exactly one
+     * __analogReadRaw() plus that characterisation, so every sample here costs a
+     * raw read PLUS a calibration lookup. This is the hottest ADC path in the
+     * firmware - updateAnalogLatch() reads all four channels on every loop pass
+     * at ~2 ms - so 8 is a deliberate cost, not a default.
      *
-     * Halving to 4 keeps the averaging that matters: the calibration fixes
-     * SYSTEMATIC gain/offset error, which is what the raw-count version had and
-     * what made this change worthwhile, but it does nothing for random jitter.
-     * Four samples still crushes the tens-of-mV per-sample spread the 8-read
-     * comment described, at half the per-sample cost. If jitter ever shows at a
-     * latch threshold again, raise this back — the fix is more samples here, not
-     * reverting to uncalibrated counts. */
+     * If it ever has to come down, drop it to 4 and change this count and the
+     * loop below together, and keep the averaging. The eFuse calibration fixes
+     * SYSTEMATIC gain/offset error, which is what made the millivolt path
+     * worthwhile at all; it does nothing for random jitter, and if jitter ever
+     * shows at a latch threshold again the fix is more samples here, never a
+     * return to uncalibrated raw counts. */
      /*
      * The count version assumes the ADC's transfer function is a straight line
      * through the origin and that full-scale really is 3300 mV. Neither holds on
@@ -352,9 +353,6 @@ static uint16_t readAnalogMv(uint8_t i) {
      * does not. */
     uint32_t sumMv = 0;
     for (uint8_t k = 0; k < 8; k++) sumMv += analogReadMilliVolts(ADC_PINS[i]);
-    /* sumMv is 8 samples of mV (from analogReadMilliVolts) so the average
-     * is sumMv/8. The comment above (reverted in this patch set) incorrectly
-     * claimed 4; it's 8. */
     uint32_t mv = (uint32_t)((sumMv / 8.0f) * ADC_DIVIDER);
     return (uint16_t)(mv > 60000u ? 60000u : mv);
 }
@@ -582,7 +580,8 @@ static void ledInit() {
     if (rmt_config(&cfg) == ESP_OK && rmt_driver_install(LED_RMT_CHAN, 0, 0) == ESP_OK) {
         ledApply();
         Serial.printf("led bar: %u px on GPIO%u (cap %u/255)\n",
-                      LED_COUNT, g_cfg.pin.ledData, LED_BRIGHT_MAX);
+                      (unsigned)LED_COUNT, (unsigned)g_cfg.pin.ledData,
+                      (unsigned)LED_BRIGHT_MAX);
     } else {
         Serial.println("led bar: RMT init FAILED");
     }
@@ -2550,9 +2549,17 @@ static void handleCommand(const String& line) {
                  * O/Y/A arms follow. Out-of-range values are still CLAMPED
                  * rather than refused, which is the documented behaviour of the
                  * constrain() family elsewhere in this file. */
+                /* Range is 0-255, NOT 0-LED_BRIGHT_MAX. This used to print
+                 * LED_BRIGHT_MAX (64) here while the two lines above clamp at
+                 * 255 - so the refusal told the operator a ceiling the code
+                 * does not enforce. LED_BRIGHT_MAX is a DOWNSTREAM cap: ledApply()
+                 * scales the stored 0-255 value down into 0-64 before it reaches
+                 * the WS2812s, because LED_COUNT pixels cannot take full duty.
+                 * Two different numbers, and this message was printing the wrong
+                 * one for the thing the operator is actually typing. */
                 Serial.printf("L: expected 3 numbers r g b, got \"%s\" "
-                              "(each 0-%u, clamped) | L 0 = off | L ? = report\n",
-                              val.c_str(), LED_BRIGHT_MAX);
+                              "(each 0-255, clamped) | L 0 = off | L ? = report\n",
+                              val.c_str());
             }
             break;
         }
@@ -2892,9 +2899,28 @@ static void handleCommand(const String& line) {
             if (s_gasHist.minPct < 0)
                 Serial.println("gas history: unseeded (learns from first tank read)");
             else
-                Serial.printf("gas history: LO %d%% (%dmv) HI %d%% (%dmv)\n",
-                              s_gasHist.minPct, s_gasHist.minMv,
-                              s_gasHist.maxPct, s_gasHist.maxMv);
+                /* Do NOT print these as two pairs. It used to, as
+                 * "LO minPct% (minMv mv) HI maxPct% (maxMv mv)", and both halves
+                 * of that were wrong:
+                 *
+                 *  - The pairing is inverted. On a normal sender low mV = full,
+                 *    so the lowest PERCENT comes from the HIGHEST mV. gasHistory
+                 *    Rescore() above already encodes the correct mapping
+                 *    (loPct <- maxMv, hiPct <- minMv, then order-normalised);
+                 *    this print just did not follow it, so the two numbers shown
+                 *    beside each other were from opposite ends of the tank.
+                 *
+                 *  - They are not even from the same sample. gasHistoryUpdate()
+                 *    moves minPct, maxPct, minMv and maxMv by four independent
+                 *    comparisons, so a low-percent reading on one pass and a
+                 *    low-mV reading on another leave the two fields describing
+                 *    different moments entirely. No reordering fixes that.
+                 *
+                 * So report the band and the mV span as what they are: two
+                 * ranges, not four paired values. */
+                Serial.printf("gas history: band %d%%..%d%%  (mV %d..%d, low mV = full)\n",
+                              s_gasHist.minPct, s_gasHist.maxPct,
+                              s_gasHist.minMv, s_gasHist.maxMv);
             {
                 const uint16_t *gc = g_cfg.gasCalMv;
                 /* This was a THIRD hand-written copy of the poison predicate, the
@@ -3110,7 +3136,7 @@ static void handleCommand(const String& line) {
                 }
             } else if (skipIdx >= 0 && skipIdx <= 6) {
                 if (!pinAliasFree((uint8_t)pin, skipIdx, PINASSIGN_NONE)) {
-                    Serial.printf("pin rejected: GPIO%u already in use by another mapped pin\n", pin);
+                    Serial.printf("pin rejected: GPIO%u already in use by another mapped pin\n", (unsigned)pin);
                     break;
                 }
             } else if (skipIdx > 6) {
@@ -3238,7 +3264,7 @@ static void handleCommand(const String& line) {
                     Serial.printf("X %s REFUSED: buzzer pin GPIO%u is the IAC pin. A manual "
                                   "test would take the idle-air valve off its 250Hz PWM. "
                                   "Give the buzzer its own pin first: P BZ <pin>\n",
-                                  val.c_str(), g_cfg.pin.iac);
+                                  val.c_str(), (unsigned)g_cfg.pin.iac);
                     break;
                 }
                 s_buzzManual = true;                 // pause auto drive; X 9 or the timeout gives it back
@@ -3270,7 +3296,7 @@ static void handleCommand(const String& line) {
                      * on it the message contradicted the code. Report what the
                      * guard actually did instead of claiming a restore. */
                     Serial.printf("buzzpin=auto, but GPIO%u is the IAC pin — not touched, "
-                                  "it is on 250Hz PWM\n", g_cfg.pin.iac);
+                                  "it is on 250Hz PWM\n", (unsigned)g_cfg.pin.iac);
                 }
             }
             else Serial.println("X0=pullup-hiz X1=float X2=3v3 X3=gnd(beep) X9=auto");
