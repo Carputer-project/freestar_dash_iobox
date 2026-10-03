@@ -229,10 +229,10 @@ static uint8_t  s_outpc[72];
 static volatile uint32_t s_groupMask = 0;
 static uint32_t           s_groupMaskSnap = 0;  // snapshot of the mask that matches the last decoded payload
 static inline bool groupSeen(uint8_t i) { return (s_groupMaskSnap >> i) & 1u; }
-static uint32_t s_lastFrameMs = 0;
-static uint32_t s_realRxMs = 0;    // any REAL frame received (proves link alive)
-static bool     s_canFresh = false;
-static bool     s_anyGroupSeen = false;
+static volatile uint32_t s_lastFrameMs = 0;
+static uint32_t           s_realRxMs = 0;    // any REAL frame received (proves link alive)
+static bool               s_canFresh = false;
+static volatile bool     s_anyGroupSeen = false;
 
 static constexpr uint8_t ADC_PINS[4] = { PIN_A1, PIN_A2, PIN_A3, PIN_A4 };
 
@@ -352,6 +352,9 @@ static uint16_t readAnalogMv(uint8_t i) {
      * does not. */
     uint32_t sumMv = 0;
     for (uint8_t k = 0; k < 8; k++) sumMv += analogReadMilliVolts(ADC_PINS[i]);
+    /* sumMv is 8 samples of mV (from analogReadMilliVolts) so the average
+     * is sumMv/8. The comment above (reverted in this patch set) incorrectly
+     * claimed 4; it's 8. */
     uint32_t mv = (uint32_t)((sumMv / 8.0f) * ADC_DIVIDER);
     return (uint16_t)(mv > 60000u ? 60000u : mv);
 }
@@ -674,11 +677,13 @@ static void espnowRecv(const uint8_t* mac, const uint8_t* data, int len) {
             // mask==0 = heartbeat: link alive but dash has no fresh ECU data.
             // Do NOT refresh s_lastFrameMs — lets the failsafe trip.
             if (mask == 0) break;
+            uint16_t m = mask & 0x1FFu;
+            if (m == 0) break;           // discard masks with no live groups
             portENTER_CRITICAL(&s_outpcMux);
             memcpy(s_outpc, &data[3], 72);
-            s_groupMask = mask & 0x1FFu;   // 9 groups are live; ignore any stray high bits
+            s_groupMask = m;              // 9 groups are live; ignore stray high bits
             portEXIT_CRITICAL(&s_outpcMux);
-            s_anyGroupSeen = mask != 0;
+            s_anyGroupSeen = true;
             s_lastFrameMs = millis();
             s_realRxMs = millis();
             break;
@@ -1359,7 +1364,7 @@ static int gasPctFromMv(int16_t mv) {
     return 0;
 }
 
-static inline int gasPctFromFilt() { return gasPctFromMv(s_gasFilt); }
+static inline int gasPctFromFilt() { return constrain(gasPctFromMv(s_gasFilt), 0, 100); }
 
 /* FUEL-USAGE HISTORY: the lowest and highest fuel levels this tank has been
  * driven to since the box was fitted, in BOTH damped mV and the resulting %.
@@ -1388,6 +1393,7 @@ struct GasHistory {
     int16_t  maxMv  = -1;
 };
 static GasHistory s_gasHist;
+static uint32_t s_gasHistLastSaveMs = 0;
 
 static void gasHistorySave() {
     g_prefs.putBytes("gaslog", &s_gasHist, sizeof(s_gasHist));
@@ -1453,7 +1459,12 @@ static void gasHistoryUpdate() {
     if (s_gasHist.minPct < 0) {
         s_gasHist.minPct = s_gasHist.maxPct = (int8_t)pct;
         s_gasHist.minMv  = s_gasHist.maxMv  = (int16_t)mv;
+        /* ALWAYS saved, no rate limit. This is a one-shot seed, not a recurring
+         * write - it only runs on a history that is still empty. Rate-limiting
+         * it means a reset followed by a power cut inside the window leaves an
+         * empty history in NVS and the whole band has to be re-learned. */
         gasHistorySave();
+        s_gasHistLastSaveMs = millis();
         return;
     }
     bool changed = false;
@@ -1461,7 +1472,19 @@ static void gasHistoryUpdate() {
     if (pct > s_gasHist.maxPct) { s_gasHist.maxPct = (int8_t)pct; changed = true; }
     if (mv  < s_gasHist.minMv)  { s_gasHist.minMv  = (int16_t)mv; changed = true; }
     if (mv  > s_gasHist.maxMv)  { s_gasHist.maxMv  = (int16_t)mv; changed = true; }
-    if (changed) gasHistorySave();
+    /* Rate-limited. Without this a monotonic drain moves maxMv by 1 mV at a
+     * time, every step is a new extreme, and the update path wrote NVS about
+     * once a second for the whole drive - flash wear bought for nothing.
+     *
+     * Dropping an extreme here is not a permanent loss: the value stays in RAM,
+     * so the band on screen is still correct, and on the next boot that reading
+     * is compared against the stale stored value, comes out as `changed` again
+     * and is written. The worst case is a 30 s window where NVS holds a band
+     * slightly narrower than the one on screen. */
+    if (changed && (millis() - s_gasHistLastSaveMs > 30000)) {
+        gasHistorySave();
+        s_gasHistLastSaveMs = millis();
+    }
 }
 
 // Needle gauge: center pivot (120,128), 240 deg sweep (150..390) across the top,
@@ -2713,6 +2736,7 @@ static void handleCommand(const String& line) {
             if (val == "R" || val == "RESET") {
                 memcpy(g_cfg.gasCalMv, kGasStockMv, sizeof(g_cfg.gasCalMv));
                 s_gasFilt = -1;
+                gasSampleMv();                     /* reseed filter so gasPctFromFilt() doesn't return 100 for one pass */
                 s_gasHist = GasHistory{};
                 gasHistorySave();
                 saveCfg();
@@ -2734,6 +2758,25 @@ static void handleCommand(const String& line) {
                     Serial.printf("gas point REJECTED: %u mv off-scale (open or shorted sender?) - no cal recorded\n", raw);
                     break;
                 }
+                /* Reject a mid anchor that would break monotonic ordering of the
+                 * calibration table. gasCalMapTable() and gasPctFromMv() both
+                 * assume FULL->EMPTY is monotonic in either slope direction
+                 * (low mV = full OR high mV = full). A mid that crosses its
+                 * neighbour makes the piecewise interpolation return values
+                 * outside [0,100], which updateGasDisplay() uses unconstrained.
+                 * Check the candidate value `raw` (not the stored old value)
+                 * against both immediate neighbours, handling both slopes. */
+                if (slot >= 1 && slot <= 3) {
+                    int32_t lo = g_cfg.gasCalMv[slot - 1], hi = g_cfg.gasCalMv[slot + 1];
+                    if (lo > hi) { int32_t t = lo; lo = hi; hi = t; }   // normalise for slope
+                    bool ok = (raw > lo && raw < hi);
+                    if (!ok) {
+                        Serial.printf("gas point %u REJECTED: %u mv not between neighbours %u and %u\n",
+                                      slot, (unsigned)raw, (unsigned)g_cfg.gasCalMv[slot - 1],
+                                      (unsigned)g_cfg.gasCalMv[slot + 1]);
+                        break;
+                    }
+                }
                 g_cfg.gasCalMv[slot] = raw;
                 // Re-linearise 1/4..3/4 between the anchors whenever an anchor
                 // is (re)set. Signed math keeps it correct for BOTH slopes:
@@ -2748,7 +2791,7 @@ static void handleCommand(const String& line) {
                         Serial.println("gas mids re-linearised; refine with Q 1/2/3 after F/E");
                     }
                 }
-                s_gasFilt = -1;                     // reseed filter after cal change
+                s_gasFilt = -1; gasSampleMv();      // reseed filter after cal change
                 // The stored percentages now describe a calibration that no longer
                 // exists; re-derive them from the recorded mV so the history band
                 // matches the needle. ('Q R' above needs no rescore — it wipes the
@@ -2786,7 +2829,7 @@ static void handleCommand(const String& line) {
                 if (d < 0 || d > 15) { Serial.println("damp 0-15"); break; }
                 if ((uint8_t)d != g_cfg.gasDamp) {
                     g_cfg.gasDamp = (uint8_t)d;
-                    s_gasFilt = -1;          // reseed the filter on any change
+                    s_gasFilt = -1; gasSampleMv();   // reseed the filter on any change
                     saveCfg();
                 }
                 Serial.printf("gas damp=%u\n", d);
@@ -3007,7 +3050,7 @@ static void handleCommand(const String& line) {
                 s_buzzManual = false;
                 s_buzzManualUntilMs = 0;
                 s_buzzLoop   = false;
-                s_gasFilt = -1;
+                s_gasFilt = -1; gasSampleMv();
                 applyPinConfig();
                 // Same trap on the backlight: g_cfg.ledOn is now false, but the
                 // WS2812 bar keeps emitting the pre-wipe colour until the next `L`
@@ -3440,7 +3483,21 @@ static void applyPinConfig() {
         digitalWrite(g_cfg.pin.buzz, HIGH);           // silent at boot
     }
     outputsOff();
-    setIac(0);
+    /* iacFailDuty, NOT 0. Per the note on setIac() 0% is the CLOSED stop, so
+     * this used to shut the idle-air valve on every boot and on every `P`
+     * command.
+     *
+     * The setup() window is the worst part: applyPinConfig() runs BEFORE
+     * updateOutputs() ever does, and updateOutputs() deliberately returns early
+     * to "hold" the last commanded duty when the link is down. So a watchdog
+     * reset or a brownout mid-drive left the valve commanded shut for the whole
+     * of setup() - roughly 1.2 s - with the engine running. A restart is a bad
+     * moment to also close the idle air.
+     *
+     * 35% is the same fail-safe value updateOutputs() uses on the
+     * engine-stopped link-loss path, so the valve now sits in one consistent
+     * idle-appropriate place instead of two different ones. */
+    setIac(g_cfg.iacFailDuty);
 
     for (uint8_t i = 0; i < 7; i++) s_lastOut[i] = g_cfg.pin.out[i];
     s_lastIac      = g_cfg.pin.iac;
@@ -3632,7 +3689,8 @@ void setup() {
 }
 
 void loop() {
-    s_canFresh = s_anyGroupSeen && (millis() - s_lastFrameMs) < FAILSAFE_MS;
+    uint32_t lastFrm = s_lastFrameMs;
+    s_canFresh = s_anyGroupSeen && (millis() - lastFrm) < FAILSAFE_MS;
     decodeOutpc();
     // Sample the fuel sender on a FIXED cadence, before any consumer, so every
     // reader below (0xB0 frame, gas history, gas display, low-fuel buzzer test,
