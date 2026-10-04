@@ -232,19 +232,35 @@ static constexpr uint16_t CFG_MAGIC = 0x4971;   // 0x4970→0x4971: wipe poisone
 /* Number of gas calibration anchors, and the span of the percentage axis
  * between each pair of neighbours, in TENTHS of a percent.
  *
- * 9 anchors = 8 segments = 12.5% per segment, which is not an integer. The
+ * 13 anchors = 12 segments = 8.333% per segment, which is not an integer. The
  * mapping used to hardcode `100 - i * 25`, valid only because 5 anchors gave
- * 25% steps. Doing 12.5 in integer percent silently truncates every odd
- * segment, so the axis is carried in tenths (1000 = 100%) and divided down
- * once at the end. GAS_SEG is derived, never typed twice. */
-static constexpr uint8_t GAS_ANCHORS = 9;
-static constexpr uint8_t GAS_SEG     = GAS_ANCHORS - 1;      /* 8 segments   */
+ * 25% steps. Doing 8.33 in integer percent silently truncates every segment,
+ * so the axis is carried in tenths (1000 = 100%) and divided down once at the
+ * end. GAS_SEG is derived, never typed twice.
+ *
+ * 13 anchors instead of 9 (2026-10-04): more anchors means each segment
+ * assumes the sender is linear over a SHORTER span, so the error from the
+ * sender's real curve is smaller. Span per segment went 2610 mV -> 1740 mV.
+ * Only the two ends (3228 full, 24109 empty) are measured; the interior
+ * values are exact even divisions of that span.
+ *
+ * The tenths step MUST be rounded, not truncated. `GAS_TENTHS / GAS_SEG` is
+ * integer division: at 9 anchors 1000/8 = 125 exactly, so it was harmless,
+ * but at 13 anchors 1000/12 = 83 and 12 x 83 = 996 - the gauge would top out
+ * at 99.6% and every segment would sit low. Round to nearest instead, and
+ * pin the last anchor to exactly 0 so the empty end cannot drift. */
+static constexpr uint8_t GAS_ANCHORS = 13;
+static constexpr uint8_t GAS_SEG     = GAS_ANCHORS - 1;      /* 12 segments  */
 static constexpr int32_t GAS_TENTHS  = 1000;                  /* 100.0%       */
-/* percent x10 at anchor i, descending: i=0 -> 1000 (full), i=8 -> 0 (empty) */
-static constexpr int32_t gasPctTenths(uint8_t i) { return GAS_TENTHS - (int32_t)i * (GAS_TENTHS / GAS_SEG); }
+/* percent x10 at anchor i, descending: i=0 -> 1000 (full), i=GAS_SEG -> 0 (empty) */
+static constexpr int32_t gasPctTenths(uint8_t i) {
+    return (i >= GAS_SEG) ? 0
+         : GAS_TENTHS - (int32_t)((i * GAS_TENTHS + GAS_SEG / 2) / GAS_SEG);
+}
 
 static constexpr uint16_t kGasStockMv[GAS_ANCHORS] = {
-    3228, 5838, 8448, 11058, 13668, 16279, 18889, 21499, 24109
+    3228, 4968, 6708, 8448, 10189, 11929, 13668,
+    15408, 17149, 18889, 20629, 22369, 24109
 };
 struct Cfg {
     uint16_t magic = CFG_MAGIC;
@@ -1509,7 +1525,14 @@ static int gasPctFromMv(int16_t mv) {
 
     if (c[0] < c[GAS_SEG]) {   // normal slope: low mV = full, high mV = empty
         if (mv <= c[0]) return 100;
-        if (mv >= c[GAS_SEG]) return 0;
+        /* Empty is the SECOND-TO-LAST anchor, not the last. The sender's real
+         * empty reading is the one that used to land on 8% (22369 on the 13
+         * anchor table), so readings at or above it must read 0% rather than
+         * the 0-8% the final segment would otherwise interpolate. The last
+         * anchor (24109) is left in the table as calibration headroom and is
+         * simply never reached - nothing about the anchors themselves changed,
+         * so Q R still restores the same table. */
+        if (mv >= c[GAS_SEG - 1]) return 0;
         for (uint8_t i = 0; i < GAS_SEG; i++) {
             if (mv <= c[i + 1]) {
                 /* Tenths throughout, rounded to nearest at the very end: with
@@ -2952,15 +2975,23 @@ static void handleCommand(const String& line) {
                 break;
             }
             if (val == "F" || val == "E" ||
-                (val.length() == 1 && val[0] >= '1' && val[0] <= '7')) {
+                (val.length() == 1 && val[0] >= '1' && val[0] <= '9')) {
                 /* Table anchors: slot0 = FULL .. slot GAS_SEG = EMPTY. The
                  * sender's slope is read at cal time (see gasPercent) — low mV =
                  * full OR high mV = full, both supported.
                  *
                  * Q 1 / 2 / 3 keep their original meaning — the 1/4, 1/2 and
-                 * 3/4 TANK points — which with 9 anchors are slots 6, 4 and 2.
-                 * Q 4..7 name the remaining interior anchors directly (the
-                 * 12.5/37.5/62.5/87.5% points), slot == digit. */
+                 * 3/4 TANK points. Those are slot GAS_SEG/2, GAS_SEG/4 and
+                 * GAS_SEG/4*3, written as GAS_SEG - 2*d so they follow whatever
+                 * anchor count is compiled in: with 9 anchors they are slots 6,
+                 * 4 and 2; with 13 they are slots 9, 6 and 3.
+                 *
+                 * Q 4..9 name the remaining interior anchors directly,
+                 * slot == digit. The digit range used to stop at 7, which was
+                 * every interior slot when GAS_ANCHORS was 9 (slots 1..7); at
+                 * 13 anchors the interior runs 1..12, so 8/9/0 are needed for
+                 * slots 10/11/12 and anything above is unreachable from the
+                 * console (Q R still restores the full default table). */
                 uint8_t slot;
                 if (val == "F")      slot = 0;
                 else if (val == "E") slot = GAS_SEG;
