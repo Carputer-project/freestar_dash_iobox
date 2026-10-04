@@ -42,7 +42,23 @@ static constexpr uint8_t PIN_O3_DEF  = 14;
 static constexpr uint8_t PIN_O4_DEF  = 27;
 static constexpr uint8_t PIN_O5_DEF  = 26;
 static constexpr uint8_t PIN_O6_DEF  = 25;
-static constexpr uint8_t PIN_O7_DEF  = 33;
+/* O7 = the fan relay, on GPIO23.
+ *
+ * microsquirt_iobox_dash.md "Pin Map (iobox3 - LOCKED)" lists O1=13 (shift),
+ * O2=12 (launch cut), O3-O6=14/27/26/25, and "Fan relay | 23". Every other row
+ * of that table is accounted for, so 23 is the fan - and setFan() can only ever
+ * drive pin.out[fanOut-1], so the fan HAS to be one of the O slots. O7 is the
+ * only one the table leaves free, and 33 appears nowhere in it.
+ *
+ * The shipped default was 33 with fanOut = 6, i.e. the fan landed on GPIO25:
+ * an output that is not the fan. That only worked because the live box had it
+ * re-mapped with `P O7 23` + `Y 7`, and that lived in NVS only. loadCfg()
+ * rejects the stored blob whenever sizeof(Cfg) changes and writes defaults, so
+ * one config reset moved the fan off GPIO23 and every FAN ON/OFF became a no-op
+ * while the console still reported a perfectly valid fanout.
+ *
+ * The default now matches the LOCKED table, so a reset cannot strand it again. */
+static constexpr uint8_t PIN_O7_DEF  = 23;
 static constexpr uint8_t PIN_BUZZ_DEF = 32;   // only free clean pin on iobox3
 static constexpr uint8_t PIN_LED_DATA_DEF = 4; // old CAN RX pin — free since ESP-NOW migration
 static constexpr uint8_t PIN_SPEED = 5;      // ABS speed input (LM393 -> PCNT) — old CAN TX, free
@@ -59,6 +75,53 @@ static constexpr uint16_t GAS_SAMPLE_MS = 50;
 static constexpr float    ADC_R_TOP_OHM = 100000.0f;   // 2026-08-22: front-end rework — all channels 100k series
 static constexpr float    ADC_R_BOT_OHM = 4600.0f;
 static constexpr float    ADC_DIVIDER   = (ADC_R_TOP_OHM + ADC_R_BOT_OHM) / ADC_R_BOT_OHM;
+
+/* Analog input floor and default threshold, in REPORTED (source) mV.
+ *
+ * An UNDRIVEN input does not read 0. Three floating channels on this box all
+ * reported 3228 mV — identical, because the eFuse calibration offset is a
+ * per-chip constant applied to every channel. 3228 is the FLOOR, not a signal.
+ *
+ * The old default threshold was 2000 mV, which is BELOW that floor. So an
+ * unconnected A1/A2/A3 satisfied `mv >= t` from the first sample after boot,
+ * latched ON permanently, and the dash drew both arrows and the high-beam lamp
+ * as active — forever, with no wiring change and nothing on any console to say
+ * why. That is what "indicators and high beam just on" was.
+ *
+ * 8000 sits between the 3228 floor and the ~12500 mV a 12V flasher pulse
+ * produces through the same 100k/4.6k divider, so a real signal still latches
+ * with ~4700 mV of margin against the floor.
+ *
+ * The floor is the reason a threshold can be wrong at all: the divider makes
+ * an undriven node look like ~142 mV at the pin instead of 0, so any threshold
+ * under ~3.3V reported can never distinguish "not connected" from "12V".  */
+static constexpr uint16_t kAnFloorMv   = 4000;   // above the 3228 undriven floor
+static constexpr uint16_t kAnThreshDef = 8000;   // default A1-A3 threshold
+
+/* Hysteresis band, reported mV.
+ *
+ * This was 150. Through the 100k/4.6k divider that is 6.6 mV at the pin, which
+ * is far below ESP32 ADC noise, so an input hovering anywhere near the
+ * threshold re-crossed the band on nearly every 2 ms loop pass. Each crossing
+ * re-armed candSince, so the 100 ms debounce NEVER expired and the latch could
+ * not change state — a noisy input pinned the indicator on or off permanently.
+ * 600 mV is ~26 mV at the pin: still a narrow band against a 12V signal, wide
+ * enough that noise cannot re-arm the timer. */
+static constexpr int16_t kAnHystMv = 600;
+
+/* Minimum threshold a command may set, in volts.
+ *
+ * On an active-HIGH channel a threshold at or below the floor is not a
+ * calibration choice, it is a guaranteed phantom: the channel reads "active"
+ * with nothing connected to it. Reject it at the point of entry so the bug
+ * cannot be re-armed by typing, the same way it was re-armed by every config
+ * reset before the default was raised.
+ *
+ * Active-LOW is exempt. That mode latches on the voltage FALLING, so its
+ * threshold is a ceiling and the floor gate in updateAnalogLatch() does not
+ * apply to it. */
+static constexpr float kAnMinVoltsHigh = kAnFloorMv / 1000.0f;   // 4.0V
+static constexpr float kAnMinVoltsLow  = 0.1f;
 
 enum OutMode : uint8_t { OM_OFF = 0, OM_MAN = 1, OM_TEMP = 2, OM_RPM = 3 };
 
@@ -112,6 +175,15 @@ struct PinMap {
 };
 
 static constexpr uint16_t CFG_MAGIC = 0x4971;   // 0x4970→0x4971: wipe poisoned gas table (E=0 inversion), adopt 220R-front-end defaults
+/* NOT bumped for the 9-anchor gas table (2026-10-03). Widening gasCalMv from
+ * [5] to [9] grows sizeof(Cfg), and loadCfg() rejects any stored blob whose
+ * length != sizeof(g_cfg) — so the reset happens anyway, by the documented
+ * size check. Bumping the magic on top would be a second reset for the same
+ * event and would print a scary reason line for an ordinary upgrade. The stored
+ * blob that gets rejected IS the 5-anchor gas table, which is exactly the stale
+ * calibration this change replaces; everything else in it (pin map, engine
+ * profile, fan/IAC setup) is re-defaulted, which is the cost of the resize and
+ * is stated here rather than discovered at the pump. */
 /* No schema/version byte, deliberately.
  *
  * I added one, bumped CFG_MAGIC to 0x4972 to carry it, and shipped it inside a
@@ -128,12 +200,49 @@ static constexpr uint16_t CFG_MAGIC = 0x4971;   // 0x4970→0x4971: wipe poisone
  *
  * If a layout change ever does need guarding, bump CFG_MAGIC and SAY SO in the
  * commit message — the reset is the intended behaviour, not a side effect. */
-// Stock gas anchors (reported mV) for the 220R-from-3V3 A4 front end:
-// FULL=3R/1009, EMPTY=110R/25014 (Toyota FSM sender spec). Used by `Q R` to
-// clear poisoned calibration and as a safe mapping fallback in gasPctFromFilt()
-// when the recorded anchors are degenerate/off-scale — so the needle can
-// never pin at 100% on garbage data (see 2026-09-20 gas-stuck-at-full fix).
-static constexpr uint16_t kGasStockMv[5] = {1009, 4800, 9800, 16418, 25014};
+// Gas anchors (reported mV) for the 220R-from-3V3 A4 front end.
+// slot0 = FULL (100%), slot4 = EMPTY (0%). Ascending: low mV = full.
+//
+// PROVENANCE 2026-10-03 — BOTH ENDS MEASURED on this car, live off the diag
+// module console while the float was swept end to end four times:
+//   lowest  reading = 3228 mV  (fullest, float on its stop)  -> FULL
+//   highest reading = 24109 mV (emptiest, float on its stop) -> EMPTY
+//
+// The old anchors were the Toyota FSM sender spec (FULL=3R/1009,
+// EMPTY=110R/25014) and BOTH are unreachable on this car: the sender never read
+// below 3228 and never above 24109. gasPctFromMv clamps outside the anchors, so
+// the mismatch produced dead travel at BOTH ends instead of a working gauge:
+//   - 1009..3228 mV (the whole top of the scale) clamped to 100%. The gauge
+//     could never read full — 86% was the highest value seen in four passes.
+//   - 16418..25014 mV clamped to 0%. Everything from 15112 mV upward displayed
+//     0%: ~9000 mV of real float travel with a motionless needle at empty.
+//
+// The seven interior anchors are the exact midpoints of the measured span
+// (20881 mV / 8 = 2610.125 mV per segment), and they are what `Q F`/`Q E`
+// re-linearise to, so a default table and a fresh on-car calibration produce
+// identical numbers instead of silently disagreeing.
+//
+// 9 anchors, not 5: with 5 the interior anchors sat 5220 mV apart, so the
+// sender's real curvature was being flattened into 4 straight chords and a
+// non-linear sender cannot be described at all. More anchors cost 8 bytes of
+// NVS and change sizeof(Cfg) — see CFG_MAGIC above for what that resets.
+/* Number of gas calibration anchors, and the span of the percentage axis
+ * between each pair of neighbours, in TENTHS of a percent.
+ *
+ * 9 anchors = 8 segments = 12.5% per segment, which is not an integer. The
+ * mapping used to hardcode `100 - i * 25`, valid only because 5 anchors gave
+ * 25% steps. Doing 12.5 in integer percent silently truncates every odd
+ * segment, so the axis is carried in tenths (1000 = 100%) and divided down
+ * once at the end. GAS_SEG is derived, never typed twice. */
+static constexpr uint8_t GAS_ANCHORS = 9;
+static constexpr uint8_t GAS_SEG     = GAS_ANCHORS - 1;      /* 8 segments   */
+static constexpr int32_t GAS_TENTHS  = 1000;                  /* 100.0%       */
+/* percent x10 at anchor i, descending: i=0 -> 1000 (full), i=8 -> 0 (empty) */
+static constexpr int32_t gasPctTenths(uint8_t i) { return GAS_TENTHS - (int32_t)i * (GAS_TENTHS / GAS_SEG); }
+
+static constexpr uint16_t kGasStockMv[GAS_ANCHORS] = {
+    3228, 5838, 8448, 11058, 13668, 16279, 18889, 21499, 24109
+};
 struct Cfg {
     uint16_t magic = CFG_MAGIC;
     PinMap pin;
@@ -175,9 +284,9 @@ struct Cfg {
     int16_t outRpm[7]  = { 7000, 0, 0, 0, 0, 0, 0 };
     bool    outManual[7] = { false, false, false, false, false, false, false };
     bool    anEnable[4] = { true, true, true, false };   // AE111 build: indicators+beam on, gas until cal
-    uint16_t anThresh[4] = { 2000, 2000, 2000, 0 };      // 2V active-high each (100k/4.6k front end)
+    uint16_t anThresh[4] = { kAnThreshDef, kAnThreshDef, kAnThreshDef, 0 };
     uint8_t anOut[4] = { 0, 0, 0, 0 };
-    uint8_t fanOut = 6;
+    uint8_t fanOut = 7;              /* = PIN_O7_DEF = GPIO23, the fan relay (see above) */
     bool    respEnable = false;
     uint8_t respId = 5;
     uint8_t _pad    = 0;          // was bootTest — kept for NVS layout (sim/boottest removed)
@@ -190,7 +299,9 @@ struct Cfg {
     // quarter tank. Caveat: 3R full = 44mV raw, below the ESP32 ADC's
     // ~150mV linear knee -> near-FULL readings are mushy until SET F
     // records the anchor through the same path (absorbs the offset).
-    uint16_t  gasCalMv[5] = {1009, 4800, 9800, 16418, 25014}; // FULL,3/4,HALF,1/4,EMPTY
+    uint16_t  gasCalMv[GAS_ANCHORS] = {
+        3228, 5838, 8448, 11058, 13668, 16279, 18889, 21499, 24109
+    };  // FULL .. EMPTY, 12.5% per segment
     uint8_t  gasDamp = 5;       // EMA smoothing 0(raw)..15 — tames small-signal sender jitter; on-car default 5 (2026-09-21)
     uint8_t  lowFuelPct = 20;   // at/below this % the gas gauge flashes red
     uint8_t  gasMpg = 25;       // assumed fuel economy for est. miles remaining
@@ -438,13 +549,27 @@ static void updateAnalogLatch() {
         int16_t t = (int16_t)g_cfg.anThresh[i];
         int16_t mv = (int16_t)min(readAnalogMv(i), (uint16_t)32767);   // clamp: >32767 would cast negative
         bool raw;
+        /* The hysteresis reference is candState, NOT s_anLatch.
+         *
+         * s_anLatch is forced from outside this function (`A<n> D1/D0`, and
+         * the !anEnable clear above); candState is written nowhere else. Any
+         * disagreement between the two desynchronises the release test from
+         * the set test, and since it is the release edge that a noisy input
+         * keeps re-crossing, the latch then cannot move in either direction.
+         * candState is the state candSince is actually measuring, so it is the
+         * correct reference for both edges. */
         if (s_anLow[i]) {
-            // GND-switched line: set at/below threshold, release above +150mV
-            raw = s_anLatch[i] ? (mv < t + 150) : (mv <= t);
+            // GND-switched line: set at/below threshold, release above +band
+            raw = candState[i] ? (mv < t + kAnHystMv) : (mv <= t);
         } else {
-            // Active-high: latch on rise above threshold, release below -150mV
-            int16_t lo = t > 150 ? t - 150 : 0;
-            raw = s_anLatch[i] ? (mv > lo) : (mv >= t);
+            /* Active-high: latch on rise above threshold, release below -band.
+             *
+             * kAnFloorMv is a hard gate, and it is the whole point: an
+             * UNDRIVEN input reads ~3228 mV, not 0, so a threshold under the
+             * floor reports "connected and active" for a channel with nothing
+             * on it. That is what pinned the indicators and high beam on. */
+            int16_t lo = t > kAnHystMv ? t - kAnHystMv : 0;
+            raw = (mv >= kAnFloorMv) && (candState[i] ? (mv > lo) : (mv >= t));
         }
         if (raw != candState[i]) { candState[i] = raw; candSince[i] = now; }
         if (now - candSince[i] >= AN_DEBOUNCE_MS && s_anLatch[i] != raw) s_anLatch[i] = raw;
@@ -1365,29 +1490,33 @@ static void gasSampleMv() {
  * corrupt NVS blob or pre-2026-09-20 firmware, and `Q R` clears it. There is
  * deliberately NO self-repair path: the repair that existed was itself the
  * defect, and with no auto-cal there is nothing left to re-introduce it. */
-static bool gasCalMapTable(uint16_t c[5]) {
+static bool gasCalMapTable(uint16_t c[GAS_ANCHORS]) {
     const uint16_t *src = g_cfg.gasCalMv;
-    bool poisoned = (src[0] >= 30000 || src[4] >= 30000 ||   // open-sender clamp
-                     src[0] < 1000  || src[4] < 1000  ||     // hard-short reading
-                     src[0] == src[4]);                      // zero span
+    bool poisoned = (src[0] >= 30000 || src[GAS_SEG] >= 30000 ||   // open-sender clamp
+                     src[0] < 1000  || src[GAS_SEG] < 1000  ||     // hard-short reading
+                     src[0] == src[GAS_SEG]);                     // zero span
     if (poisoned) src = kGasStockMv;
-    for (uint8_t i = 0; i < 5; i++) c[i] = src[i];
+    for (uint8_t i = 0; i < GAS_ANCHORS; i++) c[i] = src[i];
     return poisoned;
 }
 
 static int gasPctFromMv(int16_t mv) {
-    uint16_t c[5];
+    uint16_t c[GAS_ANCHORS];
     gasCalMapTable(c);
 
-    if (c[0] < c[4]) {   // normal slope: low mV = full, high mV = empty
+    if (c[0] < c[GAS_SEG]) {   // normal slope: low mV = full, high mV = empty
         if (mv <= c[0]) return 100;
-        if (mv >= c[4]) return 0;
-        for (uint8_t i = 0; i < 4; i++) {
+        if (mv >= c[GAS_SEG]) return 0;
+        for (uint8_t i = 0; i < GAS_SEG; i++) {
             if (mv <= c[i + 1]) {
-                int hiPct = 100 - i * 25;         // % at c[i]
-                int loPct = 100 - (i + 1) * 25;   // % at c[i+1]
-                if (c[i + 1] == c[i]) return hiPct;
-                return loPct + (int32_t)(c[i + 1] - mv) * (hiPct - loPct) / (c[i + 1] - c[i]);
+                /* Tenths throughout, rounded to nearest at the very end: with
+                 * 12.5% segments, truncating per segment would bias every odd
+                 * one low and the error would compound along the scale. */
+                int32_t hiT = gasPctTenths(i);         /* %x10 at c[i] */
+                int32_t loT = gasPctTenths(i + 1);     /* %x10 at c[i+1] */
+                if (c[i + 1] == c[i]) return (int)((hiT + 5) / 10);
+                int32_t t = loT + (int32_t)(c[i + 1] - mv) * (hiT - loT) / (c[i + 1] - c[i]);
+                return (int)((t + 5) / 10);
             }
         }
         return 0;
@@ -1399,17 +1528,18 @@ static int gasPctFromMv(int16_t mv) {
     // forever — every paired SET F/SET E re-records the same high/low anchors
     // and the FULL-first check above never lets the needle fall.
     if (mv >= c[0]) return 100;
-    if (mv <= c[4]) return 0;
-    for (uint8_t i = 0; i < 4; i++) {
+    if (mv <= c[GAS_SEG]) return 0;
+    for (uint8_t i = 0; i < GAS_SEG; i++) {
         uint16_t a = c[i], b = c[i + 1];         // a >= b along the slope
         if (a == b) continue;
         if (mv <= a && mv >= b) {
-            int hiPct = 100 - i * 25;            // % at c[i] (FULL end)
-            int loPct = 100 - (i + 1) * 25;      // % at c[i+1] (EMPTY end)
+            int32_t hiT = gasPctTenths(i);       /* %x10 at c[i] (FULL end) */
+            int32_t loT = gasPctTenths(i + 1);   /* %x10 at c[i+1] (EMPTY end) */
             /* Endpoints were swapped pre-2026-09-25: `a` is the FULL (high-mV)
              * anchor so filt == a must yield hiPct, not loPct — the old line
              * returned hiPct at the EMPTY end and read ~25% high per segment. */
-            return loPct + (int32_t)(mv - b) * (hiPct - loPct) / (a - b);
+            int32_t t = loT + (int32_t)(mv - b) * (hiT - loT) / (a - b);
+            return (int)((t + 5) / 10);
         }
     }
     return 0;
@@ -1434,7 +1564,7 @@ static inline int gasPctFromFilt() { return constrain(gasPctFromMv(s_gasFilt), 0
  * gasCalMv table if this struct ever changed size.
  *
  * Self-seeds from the first plausible reading, records extremes forever, never
- * wiped. Empty reference = g_cfg.gasCalMv[4] (SET E), untouched. */
+ * wiped. Empty reference = g_cfg.gasCalMv[GAS_SEG] (SET E), untouched. */
 static constexpr uint8_t GASHIST_MAGIC = 0x4C;
 struct GasHistory {
     uint8_t  magic  = GASHIST_MAGIC;
@@ -2148,12 +2278,16 @@ static void reportStatus() {
                   g_map / 10.0f, g_mat / 10.0f, g_clt / 10.0f,
                   g_tps / 10.0f, g_batt / 10.0f, g_afr / 10.0f,
                   g_cfg.buzzerEnable ? 1 : 0);
-    Serial.printf("gas=%d%% mv=%d est=%dmi damp=%u warn<=%u%% pts[F,3/4,1/2,1/4,E]=%u,%u,%u,%u,%u\n",
+    /* Anchors printed as a run, not five named slots: the table is GAS_ANCHORS
+     * wide and a printf listing five of nine would silently under-report the
+     * calibration. Index 0 = FULL, index GAS_SEG = EMPTY. */
+    Serial.printf("gas=%d%% mv=%d est=%dmi damp=%u warn<=%u%% pts(%d,F..E)=",
                   gasPctFromFilt(), s_gasFilt,
                   (int)((long)gasPctFromFilt() * g_cfg.tankGalX10 * g_cfg.gasMpg / 1000),
-                  g_cfg.gasDamp, g_cfg.lowFuelPct,
-                  g_cfg.gasCalMv[0], g_cfg.gasCalMv[1], g_cfg.gasCalMv[2],
-                  g_cfg.gasCalMv[3], g_cfg.gasCalMv[4]);
+                  g_cfg.gasDamp, g_cfg.lowFuelPct, GAS_ANCHORS);
+    for (uint8_t i = 0; i < GAS_ANCHORS; i++)
+        Serial.printf("%s%u", i ? "," : "", g_cfg.gasCalMv[i]);
+    Serial.println();
     Serial.printf("fan=%d fanon=%.1fF fanoff=%.1fF fanout=%d", g_cfg.fanOut >= 1 && g_cfg.fanOut <= 7 && digitalRead(g_cfg.pin.out[g_cfg.fanOut - 1]) ? 1 : 0,
                   g_cfg.fanOnTemp / 10.0f, g_cfg.fanOffTemp / 10.0f, g_cfg.fanOut);
     Serial.printf(" iac=%s duty=%d", g_cfg.iacFollow ? "follow" : (g_cfg.iacAuto ? "auto" : "manual"),
@@ -2669,8 +2803,13 @@ static void handleCommand(const String& line) {
                 uint8_t o = (uint8_t)(m[1] - '1');      // m[1] == '\0' on a bare "O" -> out of range
                 String tArg = m.substring(2);
                 tArg.trim();
+                /* Floor-enforced on BOTH halves. This arm forces active-HIGH, so
+                 * a threshold at or under kAnFloorMv could only ever report a
+                 * phantom on a channel with nothing connected — refused here
+                 * rather than stored, for the same reason the default was
+                 * raised: it must not be re-armable by typing. */
                 float v = argIsFloat(tArg) ? tArg.toFloat() : -1.0f;
-                if (o <= 6 && v >= 0.1f && v <= 15.0f) {
+                if (o <= 6 && v >= kAnMinVoltsHigh && v <= 15.0f) {
                     /* Polarity: these two forms carry none, so they reset it to
                      * active-HIGH, exactly as the plain form does. They used to
                      * touch neither s_anLow[n] nor saveAnPol(), so `A3 L2` then
@@ -2695,7 +2834,8 @@ static void handleCommand(const String& line) {
                                                "an idling-12V wire will now latch ON, use A%uL<v> for gnd-switched\n", n + 1, n + 1);
                 } else {
                     accept = false;
-                    Serial.printf("A%u O<k> <v>, k=1..7 v=0.1-15.0V (got \"%s\")\n", n + 1, m.c_str());
+                    Serial.printf("A%u O<k> <v>, k=1..7 v=%.1f-15.0V (got \"%s\")\n", n + 1,
+                                  kAnMinVoltsHigh, m.c_str());
                 }
             } else if (m.startsWith("F")) {
                 /* Same two-part contract as the O arm, same order of checks.
@@ -2719,7 +2859,7 @@ static void handleCommand(const String& line) {
                     accept = false;
                     Serial.printf("A%u F <v>: no fan output to map to (fanOut=%u). "
                                   "Set one with Y <1-7> first.\n", n + 1, g_cfg.fanOut);
-                } else if (v >= 0.1f && v <= 15.0f) {
+                } else if (v >= kAnMinVoltsHigh && v <= 15.0f) {   // active-HIGH: floor applies
                     bool wasLow = s_anLow[n];
                     g_cfg.anOut[n] = g_cfg.fanOut;
                     g_cfg.anEnable[n] = true;
@@ -2732,7 +2872,8 @@ static void handleCommand(const String& line) {
                                                "an idling-12V wire will now latch ON, use A%uL<v> for gnd-switched\n", n + 1, n + 1);
                 } else {
                     accept = false;
-                    Serial.printf("A%u F <v>, v=0.1-15.0V (got \"%s\")\n", n + 1, m.c_str());
+                    Serial.printf("A%u F <v>, v=%.1f-15.0V (got \"%s\")\n", n + 1,
+                                  kAnMinVoltsHigh, m.c_str());
                 }
             } else if (m.length() >= 2 && (m[0] == 'H' || m[0] == 'L')) {
                 // H<v> = active-high threshold, L<v> = active-low (GND-switched).
@@ -2752,20 +2893,24 @@ static void handleCommand(const String& line) {
                 String tArg = m.substring(1);
                 tArg.trim();
                 float v = argIsFloat(tArg) ? tArg.toFloat() : -1.0f;
-                if (v >= 0.1f && v <= 15.0f) {
+                /* Floor applies to H only. L is a CEILING on a GND-switched
+                 * wire, so it keeps the old 0.1V minimum. */
+                const bool lowMode = (m[0] == 'L');
+                const float vmin = lowMode ? kAnMinVoltsLow : kAnMinVoltsHigh;
+                if (v >= vmin && v <= 15.0f) {
                     g_cfg.anEnable[n] = true;
                     g_cfg.anThresh[n] = (uint16_t)(v * 1000.0f);
-                    s_anLow[n] = (m[0] == 'L');
+                    s_anLow[n] = lowMode;
                     saveAnPol();
                     Serial.printf("a%u thr=%.1fV %s\n", n + 1, v, s_anLow[n] ? "LOW(gnd)" : "HIGH(12V)");
                 } else {
                     accept = false;
-                    Serial.printf("A%u %c<v>, v=0.1-15.0V (got \"%s\")\n", n + 1, m[0], tArg.c_str());
+                    Serial.printf("A%u %c<v>, v=%.1f-15.0V (got \"%s\")\n", n + 1, m[0], vmin, tArg.c_str());
                 }
             } else {
-                // Plain form: active-high threshold
+                // Plain form: active-high threshold, so the floor applies.
                 float v = argIsFloat(m) ? m.toFloat() : -1.0f;
-                if (v >= 0.1f && v <= 15.0f) {
+                if (v >= kAnMinVoltsHigh && v <= 15.0f) {
                     g_cfg.anEnable[n] = true;
                     g_cfg.anThresh[n] = (uint16_t)(v * 1000.0f);
                     s_anLow[n] = false;
@@ -2773,7 +2918,8 @@ static void handleCommand(const String& line) {
                     Serial.printf("a%u thr=%.1fV HIGH(12V)\n", n + 1, v);
                 } else {
                     accept = false;
-                    Serial.printf("A%u <v>, v=0.1-15.0V (got \"%s\")\n", n + 1, m.c_str());
+                    Serial.printf("A%u <v>, v=%.1f-15.0V (got \"%s\")\n", n + 1,
+                                  kAnMinVoltsHigh, m.c_str());
                 }
             }
             if (accept) saveCfg();
@@ -2799,14 +2945,26 @@ static void handleCommand(const String& line) {
                 s_gasHist = GasHistory{};
                 gasHistorySave();
                 saveCfg();
-                Serial.println("gas cal + history reset to stock (F=1009 E=25014) - now press SET FULL at a full tank, SET EMPTY at empty");
+                Serial.println("gas cal + history reset to measured default (F=3228 E=24109) - no SET FULL/EMPTY needed on this car");
                 break;
             }
-            if (val == "F" || val == "E" || val == "1" || val == "2" || val == "3") {
-                // Table anchors: slot0 = FULL .. slot4 = EMPTY. The sender's
-                // slope is read at cal time (see gasPercent) — low mV = full OR
-                // high mV = full, both supported.
-                uint8_t slot = (val == "F") ? 0 : (val == "E") ? 4 : (uint8_t)(4 - val.toInt());
+            if (val == "F" || val == "E" ||
+                (val.length() == 1 && val[0] >= '1' && val[0] <= '7')) {
+                /* Table anchors: slot0 = FULL .. slot GAS_SEG = EMPTY. The
+                 * sender's slope is read at cal time (see gasPercent) — low mV =
+                 * full OR high mV = full, both supported.
+                 *
+                 * Q 1 / 2 / 3 keep their original meaning — the 1/4, 1/2 and
+                 * 3/4 TANK points — which with 9 anchors are slots 6, 4 and 2.
+                 * Q 4..7 name the remaining interior anchors directly (the
+                 * 12.5/37.5/62.5/87.5% points), slot == digit. */
+                uint8_t slot;
+                if (val == "F")      slot = 0;
+                else if (val == "E") slot = GAS_SEG;
+                else {
+                    uint8_t d = (uint8_t)(val[0] - '0');
+                    slot = (d <= 3) ? (uint8_t)(GAS_SEG - 2 * d) : d;
+                }
                 uint16_t raw = readAnalogMv(3);
                 // Off-scale rejection (2026-09-20 stuck-at-full bug): an open
                 // sender reads ~60k (clamped to 60000), a dead short ~0.
@@ -2825,7 +2983,7 @@ static void handleCommand(const String& line) {
                  * outside [0,100], which updateGasDisplay() uses unconstrained.
                  * Check the candidate value `raw` (not the stored old value)
                  * against both immediate neighbours, handling both slopes. */
-                if (slot >= 1 && slot <= 3) {
+                if (slot >= 1 && slot <= GAS_SEG - 1) {
                     int32_t lo = g_cfg.gasCalMv[slot - 1], hi = g_cfg.gasCalMv[slot + 1];
                     if (lo > hi) { int32_t t = lo; lo = hi; hi = t; }   // normalise for slope
                     bool ok = (raw > lo && raw < hi);
@@ -2837,17 +2995,21 @@ static void handleCommand(const String& line) {
                     }
                 }
                 g_cfg.gasCalMv[slot] = raw;
-                // Re-linearise 1/4..3/4 between the anchors whenever an anchor
-                // is (re)set. Signed math keeps it correct for BOTH slopes:
-                // c[0]<c[4] rising (low mV = full) or c[0]>c[4] falling
-                // (high mV = full). Explicit Q 1/2/3 refinements still win,
-                // but do them AFTER F/E or they get re-linearised.
-                if (slot == 0 || slot == 4) {
-                    int32_t span = (int32_t)g_cfg.gasCalMv[4] - (int32_t)g_cfg.gasCalMv[0];
+                // Re-linearise every interior anchor whenever an END anchor is
+                // (re)set. Signed math keeps it correct for BOTH slopes:
+                // c[0]<c[GAS_SEG] rising (low mV = full) or the reverse falling
+                // (high mV = full). Explicit Q n refinements still win, but do
+                // them AFTER F/E or they get re-linearised.
+                //
+                // The divisor is GAS_SEG (segment count), not a literal 4 —
+                // that was the 5-anchor case and it is what made this loop
+                // quietly wrong the moment the table grew.
+                if (slot == 0 || slot == GAS_SEG) {
+                    int32_t span = (int32_t)g_cfg.gasCalMv[GAS_SEG] - (int32_t)g_cfg.gasCalMv[0];
                     if (span) {
-                        for (uint8_t j = 1; j < 4; j++)
-                            g_cfg.gasCalMv[j] = (uint16_t)((int32_t)g_cfg.gasCalMv[0] + span * j / 4);
-                        Serial.println("gas mids re-linearised; refine with Q 1/2/3 after F/E");
+                        for (uint8_t j = 1; j < GAS_SEG; j++)
+                            g_cfg.gasCalMv[j] = (uint16_t)((int32_t)g_cfg.gasCalMv[0] + span * j / GAS_SEG);
+                        Serial.println("gas mids re-linearised; refine with Q 1..7 after F/E");
                     }
                 }
                 s_gasFilt = -1; gasSampleMv();      // reseed filter after cal change
@@ -2942,12 +3104,14 @@ static void handleCommand(const String& line) {
                 Serial.printf("tank=%.1f gal\n", g_cfg.tankGalX10 / 10.0f);
                 break;
             }
-            Serial.printf("gas=%d%% mv=%d est=%dmi damp=%u warn<=%u%% mpg=%u tank=%.1fgal pts[F,3/4,1/2,1/4,E]=%u,%u,%u,%u,%u\n",
+            Serial.printf("gas=%d%% mv=%d est=%dmi damp=%u warn<=%u%% mpg=%u tank=%.1fgal pts(%d,F..E)=",
                           gasPctFromFilt(), s_gasFilt,
                           (int)((long)gasPctFromFilt() * g_cfg.tankGalX10 * g_cfg.gasMpg / 1000),
                           g_cfg.gasDamp, g_cfg.lowFuelPct, g_cfg.gasMpg, g_cfg.tankGalX10 / 10.0f,
-                          g_cfg.gasCalMv[0], g_cfg.gasCalMv[1], g_cfg.gasCalMv[2],
-                          g_cfg.gasCalMv[3], g_cfg.gasCalMv[4]);
+                          GAS_ANCHORS);
+                for (uint8_t i = 0; i < GAS_ANCHORS; i++)
+                    Serial.printf("%s%u", i ? "," : "", g_cfg.gasCalMv[i]);
+                Serial.println();
             if (s_gasHist.minPct < 0)
                 Serial.println("gas history: unseeded (learns from first tank read)");
             else
@@ -2983,7 +3147,7 @@ static void handleCommand(const String& line) {
                  * against the stock span instead, or vice versa. Ask the owner,
                  * which returns "was poisoned" directly.
                  */
-                uint16_t eff[5];
+                uint16_t eff[GAS_ANCHORS];
                 if (gasCalMapTable(eff))
                     Serial.println("WARN: anchors off-scale/degenerate -> mapping STOCK span. Send Q R to reset, then SET FULL/SET EMPTY.");
                 else if (gc[0] > gc[4])
