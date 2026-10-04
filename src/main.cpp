@@ -41,24 +41,30 @@ static constexpr uint8_t PIN_O2_DEF  = 12;
 static constexpr uint8_t PIN_O3_DEF  = 14;
 static constexpr uint8_t PIN_O4_DEF  = 27;
 static constexpr uint8_t PIN_O5_DEF  = 26;
-static constexpr uint8_t PIN_O6_DEF  = 25;
-/* O7 = the fan relay, on GPIO23.
+static constexpr uint8_t PIN_O6_DEF  = 23;   /* the fan relay - see below */
+/* O6 = the fan relay, on GPIO23.
  *
- * microsquirt_iobox_dash.md "Pin Map (iobox3 - LOCKED)" lists O1=13 (shift),
- * O2=12 (launch cut), O3-O6=14/27/26/25, and "Fan relay | 23". Every other row
- * of that table is accounted for, so 23 is the fan - and setFan() can only ever
- * drive pin.out[fanOut-1], so the fan HAS to be one of the O slots. O7 is the
- * only one the table leaves free, and 33 appears nowhere in it.
+ * Two facts fix this, and neither is a guess:
  *
- * The shipped default was 33 with fanOut = 6, i.e. the fan landed on GPIO25:
- * an output that is not the fan. That only worked because the live box had it
- * re-mapped with `P O7 23` + `Y 7`, and that lived in NVS only. loadCfg()
- * rejects the stored blob whenever sizeof(Cfg) changes and writes defaults, so
- * one config reset moved the fan off GPIO23 and every FAN ON/OFF became a no-op
- * while the console still reported a perfectly valid fanout.
+ *   microsquirt_iobox_dash.md, "Pin Map (iobox3 - LOCKED)", has a dedicated
+ *   row `Fan relay | 23 | ULN2003A channel (Cfg.fanOut)`. So the relay is on
+ *   GPIO23. The shipped default map O1..O7 = {13,12,14,27,26,25,33} contained
+ *   no 23 at all, so the FACTORY DEFAULT COULD NOT DRIVE THE FAN - which is
+ *   only defensible if the installer always re-mapped it by hand.
  *
- * The default now matches the LOCKED table, so a reset cannot strand it again. */
-static constexpr uint8_t PIN_O7_DEF  = 23;
+ *   They did, and the slot was 6: the live box's own status line read
+ *   `fanOut 6/200-190F` (howtolog 2026-08-28). So the last configuration known
+ *   to work is fanOut = 6 with out[5] re-pointed at 23.
+ *
+ * That pair is now the default, so the defaults reproduce the last known-good
+ * map instead of contradicting it. (An earlier revision of this comment put 23
+ * on O7 and set fanOut = 7 - reasoning that "O7 is the only slot the LOCKED
+ * table leaves free". That is a plausible story with no evidence behind it, and
+ * it contradicts the recorded fanOut 6. The evidence beats the tidy argument.)
+ *
+ * Cost, stated plainly: out[5] loses its old default of 25. 25 is a spare
+ * ULN2003A channel and `P O6 25` puts it back. */
+static constexpr uint8_t PIN_O7_DEF  = 33;   /* spare ULN2003A channel, not the fan */
 static constexpr uint8_t PIN_BUZZ_DEF = 32;   // only free clean pin on iobox3
 static constexpr uint8_t PIN_LED_DATA_DEF = 4; // old CAN RX pin — free since ESP-NOW migration
 static constexpr uint8_t PIN_SPEED = 5;      // ABS speed input (LM393 -> PCNT) — old CAN TX, free
@@ -286,7 +292,7 @@ struct Cfg {
     bool    anEnable[4] = { true, true, true, false };   // AE111 build: indicators+beam on, gas until cal
     uint16_t anThresh[4] = { kAnThreshDef, kAnThreshDef, kAnThreshDef, 0 };
     uint8_t anOut[4] = { 0, 0, 0, 0 };
-    uint8_t fanOut = 7;              /* = PIN_O7_DEF = GPIO23, the fan relay (see above) */
+    uint8_t fanOut = 6;              /* = PIN_O6_DEF = GPIO23, the fan relay (see above) */
     bool    respEnable = false;
     uint8_t respId = 5;
     uint8_t _pad    = 0;          // was bootTest — kept for NVS layout (sim/boottest removed)
@@ -2288,14 +2294,28 @@ static void reportStatus() {
     for (uint8_t i = 0; i < GAS_ANCHORS; i++)
         Serial.printf("%s%u", i ? "," : "", g_cfg.gasCalMv[i]);
     Serial.println();
-    Serial.printf("fan=%d fanon=%.1fF fanoff=%.1fF fanout=%d", g_cfg.fanOut >= 1 && g_cfg.fanOut <= 7 && digitalRead(g_cfg.pin.out[g_cfg.fanOut - 1]) ? 1 : 0,
-                  g_cfg.fanOnTemp / 10.0f, g_cfg.fanOffTemp / 10.0f, g_cfg.fanOut);
+    /* fanout= prints the SLOT. That was the whole reason a dead fan looked healthy:
+ * setFan() drives pin.out[fanOut-1], so the slot says nothing about which wire
+ * is being energised, and a slot pointing at a GPIO with no relay behind it
+ * reports a perfectly valid fanout forever. The resolved GPIO is now printed
+ * beside it, and `?` is the only place that can answer "is the fan pin the fan
+ * pin". Also print the whole map, since `P O<n>` can re-point any of them at any
+ * time and only `P` with no argument showed it.
+ *
+ * This is the same defect the o1..o7 readback line below has: it reports the
+ * pin LEVEL but not the pin NUMBER, so a map pointed at the wrong GPIO is
+ * indistinguishable from a healthy one there too. */
+Serial.printf("fan=%d fanon=%.1fF fanoff=%.1fF fanout=%d fanpin=%s",
+                  g_cfg.fanOut >= 1 && g_cfg.fanOut <= 7 && digitalRead(g_cfg.pin.out[g_cfg.fanOut - 1]) ? 1 : 0,
+                  g_cfg.fanOnTemp / 10.0f, g_cfg.fanOffTemp / 10.0f, g_cfg.fanOut,
+                  fanOutIdx() ? (String(g_cfg.pin.out[fanOutIdx() - 1])).c_str() : "none");
     Serial.printf(" iac=%s duty=%d", g_cfg.iacFollow ? "follow" : (g_cfg.iacAuto ? "auto" : "manual"),
                   g_iacDuty);
     if (!g_cfg.iacFollow && !g_cfg.iacAuto) Serial.printf(" man=%d", g_cfg.iacManualDuty);
     Serial.printf(" tgt=%d", g_cfg.iacTargetRpm);
     if (g_cfg.iacFollow) Serial.printf(" iacstep=%d", g_iacStep);
-    for (uint8_t i = 0; i < 7; i++) Serial.printf(" o%u=%d", i + 1, digitalRead(g_cfg.pin.out[i]) ? 1 : 0);
+    for (uint8_t i = 0; i < 7; i++) Serial.printf(" o%u=gpio%u:%d", i + 1, g_cfg.pin.out[i],
+                                                    digitalRead(g_cfg.pin.out[i]) ? 1 : 0);
     Serial.println();
     for (uint8_t i = 0; i < 4; i++) {
         Serial.printf("%s a%u=%.2fV%c(%s)%s%s", s_anForce[i] >= 0 ? "*" : "", i + 1,
