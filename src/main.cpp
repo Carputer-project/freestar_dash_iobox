@@ -42,22 +42,25 @@ static constexpr uint8_t PIN_O3_DEF  = 14;
 static constexpr uint8_t PIN_O4_DEF  = 27;
 static constexpr uint8_t PIN_O5_DEF  = 26;
 static constexpr uint8_t PIN_O6_DEF  = 25;
-/* O7 = the fan relay, on GPIO23.
+/* The fan relay is on GPIO13, which is output 1 (O1).
  *
- * microsquirt_iobox_dash.md "Pin Map (iobox3 - LOCKED)" lists O1=13 (shift),
- * O2=12 (launch cut), O3-O6=14/27/26/25, and "Fan relay | 23". Every other row
- * of that table is accounted for, so 23 is the fan - and setFan() can only ever
- * drive pin.out[fanOut-1], so the fan HAS to be one of the O slots. O7 is the
- * only one the table leaves free, and 33 appears nowhere in it.
+ * MEASURED with a multimeter on this board on 2026-10-04: GPIO13 switches
+ * 0 <-> 3.3 V on `F 1` / `F 0` and the fan runs. GPIO23 and GPIO25 were both
+ * measured EMPTY. This default used to be derived from the "Pin Map
+ * (iobox3 - LOCKED)" table in microsquirt_iobox_dash.md, which said "Fan
+ * relay | 23" - that table is WRONG about the fan and cost an evening: the
+ * shipped default (fanOut = 6 -> GPIO25) was wrong, then a "fix" moved it to
+ * O7/GPIO23, which was also wrong. Both were never probed.
  *
- * The shipped default was 33 with fanOut = 6, i.e. the fan landed on GPIO25:
- * an output that is not the fan. That only worked because the live box had it
- * re-mapped with `P O7 23` + `Y 7`, and that lived in NVS only. loadCfg()
- * rejects the stored blob whenever sizeof(Cfg) changes and writes defaults, so
- * one config reset moved the fan off GPIO23 and every FAN ON/OFF became a no-op
- * while the console still reported a perfectly valid fanout.
+ * DO NOT derive this pin from documentation. If sizeof(Cfg) changes, loadCfg()
+ * rejects the stored blob and writes defaults, so a wrong default silently
+ * strands the fan on an empty pin: every FAN ON/OFF becomes a no-op while the
+ * console still reports a perfectly valid fanout. The default is the LAST line
+ * of defence - `Y 1` re-points it at runtime and is persisted.
  *
- * The default now matches the LOCKED table, so a reset cannot strand it again. */
+ * GPIO13 was O1 = "shift", and that role is gone: the dash deleted
+ * can_tx_shift_rpm ('S'), so nothing else drives this pin. The output loop at
+ * updateOutputs() `continue`s past fanOut, so the fan owns it exclusively. */
 static constexpr uint8_t PIN_O7_DEF  = 23;
 static constexpr uint8_t PIN_BUZZ_DEF = 32;   // only free clean pin on iobox3
 static constexpr uint8_t PIN_LED_DATA_DEF = 4; // old CAN RX pin — free since ESP-NOW migration
@@ -286,7 +289,7 @@ struct Cfg {
     bool    anEnable[4] = { true, true, true, false };   // AE111 build: indicators+beam on, gas until cal
     uint16_t anThresh[4] = { kAnThreshDef, kAnThreshDef, kAnThreshDef, 0 };
     uint8_t anOut[4] = { 0, 0, 0, 0 };
-    uint8_t fanOut = 7;              /* = PIN_O7_DEF = GPIO23, the fan relay (see above) */
+    uint8_t fanOut = 1;              /* O1 = GPIO13, the fan relay. MEASURED 2026-10-04, see the note at PIN_O7_DEF. Do not take this from the pin table - it is wrong about the fan. */
     bool    respEnable = false;
     uint8_t respId = 5;
     uint8_t _pad    = 0;          // was bootTest — kept for NVS layout (sim/boottest removed)
