@@ -258,9 +258,26 @@ static constexpr int32_t gasPctTenths(uint8_t i) {
          : GAS_TENTHS - (int32_t)((i * GAS_TENTHS + GAS_SEG / 2) / GAS_SEG);
 }
 
+/* Re-derived 2026-10-08. The EMPTY end was 24109, recorded on a day when the
+ * sender's resting position at empty was different. With the tank genuinely
+ * empty the sender now reads ~19967 mV (3 x 120 s logs, 262 samples, medians
+ * 20021/19959/19967). The old table therefore displayed 18-23% on an empty
+ * tank and threw away ~4100 mV of real sender travel.
+ *
+ * FULL is UNCHANGED at 3228 - only the empty end moved. 13 anchors evenly
+ * divided across the 3228..19967 span ((19967-3228)/12 = 1394.9 mV per
+ * segment). The 0% cliff sits at index 11 = 18572, so every reading at or
+ * above 18572 - which is the entire observed empty-tank distribution
+ * (18239..21332, median 19967) - reads 0%.
+ *
+ * This is the FALLBACK table: the box uses it whenever the stored calibration
+ * is degenerate. The box in the car stores only 9 of 13 anchors with the last
+ * four zeroed, so it printed "anchors off-scale/degenerate -> mapping STOCK
+ * span" and ran on this table. That made this the number that actually decided
+ * the gauge, not the stored one. */
 static constexpr uint16_t kGasStockMv[GAS_ANCHORS] = {
-    3228, 4968, 6708, 8448, 10189, 11929, 13668,
-    15408, 17149, 18889, 20629, 22369, 24109
+    3228, 4623, 6018, 7413, 8808, 10203, 11598,
+    12992, 14387, 15782, 17177, 18572, 19967
 };
 struct Cfg {
     uint16_t magic = CFG_MAGIC;
@@ -2971,7 +2988,13 @@ static void handleCommand(const String& line) {
                 s_gasHist = GasHistory{};
                 gasHistorySave();
                 saveCfg();
-                Serial.println("gas cal + history reset to measured default (F=3228 E=24109) - no SET FULL/EMPTY needed on this car");
+                /* Printed from the table itself, not hardcoded. The literal here
+                 * used to say E=24109 and survived the 2026-10-08 re-derivation
+                 * that moved EMPTY to 19967 - a message that contradicted the
+                 * table it had just written is exactly the kind of thing the
+                 * next session reads as truth. */
+                Serial.printf("gas cal + history reset to measured default (F=%u E=%u) - no SET FULL/EMPTY needed on this car\n",
+                              kGasStockMv[0], kGasStockMv[GAS_SEG]);
                 break;
             }
             if (val == "F" || val == "E" ||
