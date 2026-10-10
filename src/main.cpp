@@ -1881,46 +1881,144 @@ static void drawGasRing(float fromDeg, float toDeg, int bandLoPct, int bandHiPct
     }
 }
 
+/* STRIPPED 2026-10-09 — NUMBER ONLY, at the owner's request.
+ *
+ * This used to draw the full gauge: bezel circles, the tick ring, the major
+ * ticks, the 1/4 1/2 3/4 labels, the E/F ends, "GAS", the yellow float-history
+ * band and a moving red needle. All of it is gone.
+ *
+ * WHY, and this is the diagnosis not a guess: the idle panel has been clean
+ * through the whole investigation while the gas panel garbled - on the bench,
+ * off the car, before and after the CS/DC pin swap, and with new caps and a new
+ * ground wire. Wiring and pin assignment are therefore both excluded. What
+ * separates the two panels is DRAW VOLUME: updateDisplay() is delta-gated and
+ * only touches pixels when a value actually changes, while updateGasDisplay()
+ * repainted a radial wedge (drawGasRing + drawGasMarks + needle) every 100 ms
+ * for as long as the level was moving. That is a full-frame-class operation
+ * over SOFTWARE SPI, which is bit-banged one bit at a time and has no clock
+ * control at all.
+ *
+ * A number is the cheapest possible thing to draw: one fillRect plus a handful
+ * of glyphs, and only when the digits actually change. If the panel is still
+ * garbling with this on it, the fault is not in the draw path.
+ *
+ * What was removed and what still runs:
+ *   - s_gasDisp / gasAngleDeg / drawGasNeedle / drawGasRing / drawGasMarks /
+ *     drawGasMajorTick / drawGasText / drawGasValue  -> all now unused by the
+ *     gas panel. They are left in place, not deleted: the ring/band/needle
+ *     helpers are ~150 lines and the band logic in updateGasDisplay() is the
+ *     only consumer of s_bandMin/s_bandMax. Deleting them is a separate,
+ *     larger change and should not ride along with a fault fix.
+ *   - The float history (s_gasHist) still accumulates in NVS from the 20 Hz
+ *     sampler. It is simply not displayed. Nothing is lost by re-adding it. */
+/* VERTICAL BAR, 2026-10-09, at the owner's request. Single panel now (see
+ * GAS_TFT_ENABLED / IDLE_TFT_ENABLED above), so this face has the whole 240x240
+ * to itself.
+ *
+ * Geometry. The active area is round, ~32.4 mm across, so the usable rectangle
+ * is roughly x 34..206 / y 34..206 and anything outside it is clipped by the
+ * round mask. The bar is kept well inside:
+ *
+ *   bar column : x 100..140 (40 px wide), y 52..172 (120 px tall)
+ *   full scale = 120 px, drawn from the BOTTOM up
+ *
+ * Nothing OVERLAPS the bar column. That is deliberate, and it cost one rewrite:
+ * the first attempt put the percentage inside the bar so it read against the
+ * fill, but drawGasText() clears its own background, so the number punched a
+ * black hole in the fill - and when the level DROPPED, the shrink repaint
+ * (which has to repaint the vacated track above the new top) ran over that same
+ * region and erased the number, which then could not be redrawn because
+ * drawGasText() had already stored the new string and would early-return. The
+ * text is delta-gated, so nothing would have brought it back until the
+ * percentage changed again. Bar and text each own their own pixels.
+ *
+ * Draw cost, which is the reason this face exists: the static furniture (bezel,
+ * outline, empty track, "GAS") is painted ONCE in drawGasFrame(). The
+ * per-update path paints a single fillRect of the fill column, and only when the
+ * integer height changes. At a steady level that is zero pixels - it is not the
+ * 10 Hz busy-drawing the old radial gauge was.
+ *
+ * s_gasBarH is the height already painted; -1 forces the first update to draw.
+ * A growing fillRect cannot undo itself, so a SHRINK repaints the vacated track
+ * above the new top, or every drop would leave a bright ghost above the level. */
+/* NUMBERS ONLY, size 2, centred. Back to the face that was verified clean.
+ *
+ * Two intermediate versions were tried and rejected on the panel, both on
+ * 2026-10-09: a horizontal bar with the number inside it, and a full-height
+ * column across the whole disc. The column was described as looking grey -
+ * a 200x240 px DARKGREY track is most of the screen, so it read as a grey
+ * block rather than a gauge. Neither added anything the number does not say,
+ * and both cost pixels on a software-SPI bus.
+ *
+ * Kept from the number version: a bezel ring, "GAS", the percentage centred,
+ * the miles estimate below it. Kept OUT: the bar, the ring ticks, the 1/4-1/2-3/4
+ * labels, the float-history band and the needle. */
+/* HORIZONTAL BAR, 2026-10-09. Sideways fill, left to right.
+ *
+ * Geometry. The panel is a 240x240 disc, so a full-width rect only fits inside
+ * the mask in a band around y=120 and its corners shear off anywhere else.
+ * 160 px wide at y 96..144 (48 px tall) is comfortably inside the circle across
+ * that whole span: the chord at y=96 is ~207 px, at y=144 ~207 px, so 160 px
+ * centred leaves ~23 px of margin each side at both edges of the band.
+ *
+ * Text placement, and the rule behind it: nothing may OVERLAP the bar. Any text
+ * over it has to clear its own background, which punches a hole in the fill, and
+ * when the level DROPS the vacated-track repaint runs over that same region and
+ * erases the text permanently — drawGasText() has already stored the new string
+ * and would early-return, so nothing brings it back. That bug was hit for real
+ * on the vertical-bar build and cost one rewrite. So:
+ *
+ *   y  40..58   "GAS"     (size 2, clear 60..78... see the sizes below)
+ *   y  96..144  BAR       (no text over it, ever)
+ *   y 178..216  "63%"     (size 4)
+ *   y 226..238  miles     (size 1)
+ *
+ * s_gasBarW is the fill width already painted; -1 forces the first paint. A
+ * growing fillRect cannot undo itself, so a SHRINK repaints the vacated track to
+ * its right, or every drop would leave a bright ghost. */
+static constexpr int16_t GAS_BAR_X = 40;
+static constexpr int16_t GAS_BAR_Y = 96;
+static constexpr int16_t GAS_BAR_W = 160;  // full scale = full tank
+static constexpr int16_t GAS_BAR_H = 48;
+
+static int s_gasBarW = -1;
+
 static void drawGasFrame() {
     s_gasTft->fillScreen(GC9A01A_BLACK);
-    s_gasTft->drawCircle(GAS_CX, GAS_CY, 119, GC9A01A_NAVY);
-    s_gasTft->drawCircle(GAS_CX, GAS_CY, 118, GC9A01A_DARKGREY);
-    drawGasRing(GAS_A0, GAS_A1, s_gasHist.minPct, s_gasHist.maxPct);
-    drawGasMarks();
-    s_gasTft->setTextColor(GC9A01A_LIGHTGREY);
-    s_gasTft->setTextSize(1);
-    s_gasTft->setCursor(10, 200); s_gasTft->print("E");
-    s_gasTft->setCursor(218, 200); s_gasTft->print("F");
+
+    /* Empty track, once. No bezel ring: on a face built around a bar it just
+     * competes with it, and the disc edge is the frame. */
+    s_gasTft->fillRect(GAS_BAR_X, GAS_BAR_Y, GAS_BAR_W, GAS_BAR_H, GC9A01A_DARKGREY);
+
     s_gasTft->setTextColor(GC9A01A_CYAN);
     s_gasTft->setTextSize(2);
-    s_gasTft->setCursor(102, 174);
+    s_gasTft->setCursor(96, 40);
     s_gasTft->print("GAS");
-    s_gasTft->fillCircle(GAS_CX, GAS_CY, 4, GC9A01A_RED);
-    s_needleDrawn = false;
+
     s_gasDisp = -1;
+    s_gasBarW = -1;              // force the first update to paint the fill
     s_lowWas = false;
     s_blinkPhase = false;
-    s_lastGasMv[0] = s_lastGasPct[0] = s_lastGasLow[0] = s_lastGasLo[0] = s_lastGasHi[0] = 0;
-    s_lastGasLoMv[0] = s_lastGasHiMv[0] = 0;
-    s_lastPctColor = s_lastLowColor = 0xFFFF;
-    // The float-history band is delta-tracked, and the delta tracker must
-    // describe the PANEL, not the intention - so it is set to the band
-    // drawGasRing() just drew rather than invalidated. Invalidating it to -2 used
-    // to be the only option, because drawGasFrame() drew no band at all and the
-    // band could only be painted from updateGasDisplay(); now the frame composites
-    // it with the rest of the ring, so the tracker and the pixels agree
-    // immediately and the band does not blink out for one pass after a re-init.
-    //
-    // It is still file scope, not a local of updateGasDisplay(). A function-local
-    // static survived the fillScreen() above while the pixels did not, so after
-    // ANY re-init the tracker believed the band was drawn when the panel was
-    // bare: the band stayed gone until the float's lifetime min or max happened to
-    // change, and the "erase the previous band" loop then scribbled dark ticks
-    // over a region that had just been filled, for a band that no longer existed.
-    s_bandMin = s_gasHist.minPct;
-    s_bandMax = s_gasHist.maxPct;
+    s_lastGasMv[0] = s_lastGasPct[0] = 0;
+    s_lastPctColor = 0xFFFF;
+    // The float-history band is not drawn on this face, so its delta tracker has
+    // nothing to describe. Force it to invalidate on the first update after any
+    // re-init, or a stale value would compare equal and the -2 sentinel would
+    // never be seen again. The history itself still accumulates in NVS.
+    s_bandMin = -2;
+    s_bandMax = -2;
 }
 
+/* The single-panel face: the percentage, the miles estimate, "GAS".
+ *
+ * Every 100 ms pass, and nothing more:
+ *   - walk s_gasDisp toward the target by 2%/pass (kept, so the digits ease
+ *     rather than snap - it costs nothing)
+ *   - print the number and the miles ONLY when the strings differ
+ *   - blink the number red at low fuel
+ *
+ * No bar, no ring repaints, no needle. For what that established, see the header
+ * above drawGasFrame(). */
 static void updateGasDisplay() {
     if (!g_cfg.tftEnable || s_gasTft == nullptr) return;
     char buf[12];
@@ -1933,120 +2031,92 @@ static void updateGasDisplay() {
     else if (s_gasDisp < target) s_gasDisp = s_gasDisp + 2 > target ? target : s_gasDisp + 2;
     else if (s_gasDisp > target) s_gasDisp = s_gasDisp - 2 < target ? target : s_gasDisp - 2;
 
+    /* Bar fill, left-anchored: width w is the level, growing rightward. */
+    uint16_t barColor = low ? (phase ? GC9A01A_RED : GC9A01A_DARKGREY) : GC9A01A_CYAN;
+    int w = (int)((long)s_gasDisp * GAS_BAR_W / 100);
+    if (w != s_gasBarW) {
+        if (w < s_gasBarW) {
+            /* Level dropped: repaint the vacated track to the RIGHT of the new
+             * fill, or every drop leaves a bright ghost ahead of the bar. Width
+             * is always positive here, so at w==0 the whole track is restored. */
+            s_gasTft->fillRect(GAS_BAR_X + w, GAS_BAR_Y, s_gasBarW - w, GAS_BAR_H,
+                               GC9A01A_DARKGREY);
+        }
+        if (w > 0) {
+            s_gasTft->fillRect(GAS_BAR_X, GAS_BAR_Y, w, GAS_BAR_H, barColor);
+        }
+        s_gasBarW = w;
+    } else if (low) {
+        /* Low-fuel blink with a steady level: the fill has to follow the colour
+         * even though its width did not change. Guarded on w>0 or the blink would
+         * clear the bar at 0%. */
+        if (w > 0) s_gasTft->fillRect(GAS_BAR_X, GAS_BAR_Y, w, GAS_BAR_H, barColor);
+    }
+
     int est = (int)((long)s_gasDisp * g_cfg.tankGalX10 * g_cfg.gasMpg / 1000);
     snprintf(buf, sizeof buf, "~%d mi", est);
-    drawGasValue(99, 230, 1, GC9A01A_CYAN, 44, s_lastGasMv, buf);
+    drawGasValue(92, 226, 1, GC9A01A_CYAN, 56, s_lastGasMv, buf);
 
-    float deg = gasAngleDeg(s_gasDisp);
-    bool blinkChange = low && phase != s_blinkPhase;
-    bool lowChange = low != s_lowWas;
-    bool moved = !s_needleDrawn || deg != s_needleDeg;
-
-    if (s_needleDrawn && (moved || blinkChange || lowChange)) {
-        drawGasNeedle(s_needleDeg, GC9A01A_BLACK);          // erase old needle
-        /* Put the ring back the way drawGasRing() lays it out, over exactly the
-         * wedge the black triangle can reach and no further.
-         *
-         * This used to restore ONE scale tick, placed with gasRound6(), and then
-         * repaint all five majors. That is the M13 defect: the band walks a 4.8
-         * deg grid (gasAngleDeg(2%) == 150 + 2.4*2) and the scale a 6 deg one, so
-         * the two coincide only at every fifth band tick. The triangle wipes
-         * +-4 deg, most of the band hairlines inside that arc were therefore
-         * destroyed and never repainted, and the band block below only redraws on
-         * a change of bMin/bMax - i.e. on the next new lifetime extreme, after the
-         * next fill. A single drain across the band annihilated it.
-         *
-         * drawGasMarks() is still needed separately: the 1/4 / 1/2 / 3/4 labels
-         * sit at r=70, inside the ring, so the triangle reaches them too. */
-        drawGasRing(s_needleDeg - GAS_NEEDLE_WEDGE_DEG,
-                    s_needleDeg + GAS_NEEDLE_WEDGE_DEG,
-                    s_gasHist.minPct, s_gasHist.maxPct);
-        drawGasMarks();
-    }
-
-    /* Min/Max tank-float log: a yellow band on the tick ring tracing the sweep
-     * the float has covered (from LO% up to HI%). The needle already shows the
-     * live level, so the band reads instantly with no text.
-     *
-     * Recomposites the UNION of the old and new band, with the NEW band as the
-     * band to draw. The old code painted the departing band in DARKGREY and
-     * nothing else, so any white major the band crossed was turned dark grey and
-     * never repainted, and the vacated part of the ring lost the scale ticks that
-     * were under it. Both happen whether the band grew or shrank: on a grow the
-     * vacated pixels get re-yellowed as part of the new band, so only the major
-     * is left wrong, and on a shrink they are left dark grey.
-     *
-     * Placed BEFORE the needle draw so the needle is always the top layer. It used
-     * to run last, which meant a band change could paint over the live needle
-     * without restoring it; moving it here removes that, and the ring is
-     * otherwise untouched by the needle because the needle is drawn afterwards. */
-    int16_t bMin = s_gasHist.minPct, bMax = s_gasHist.maxPct;
-    if (bMin != s_bandMin || bMax != s_bandMax) {
-        // bMin < 0 means there is no band at all now (unseeded log), so the whole
-        // arc has to be restored rather than just the old band's span.
-        int16_t lo = bMin >= 0 ? bMin : 0;
-        int16_t hi = bMin >= 0 ? bMax : 100;
-        if (s_bandMin >= 0) {
-            if (lo > s_bandMin) lo = s_bandMin;
-            if (hi < s_bandMax) hi = s_bandMax;
-        }
-        drawGasRing(gasAngleDeg(lo), gasAngleDeg(hi), bMin, bMax);
-        s_bandMin = bMin;
-        s_bandMax = bMax;
-    }
-
-    if (blinkChange || lowChange) {
-        uint16_t alarmColor = phase ? GC9A01A_RED : GC9A01A_DARKGREY;
-        s_gasTft->drawCircle(GAS_CX, GAS_CY, 118, low ? alarmColor : GC9A01A_DARKGREY);
-        s_gasTft->drawCircle(GAS_CX, GAS_CY, 119, low ? alarmColor : GC9A01A_NAVY);
-        s_gasTft->setTextSize(1);
-        s_gasTft->setTextColor(low ? alarmColor : GC9A01A_LIGHTGREY);
-        s_gasTft->setCursor(10, 200); s_gasTft->print("E");
-    }
-    if (low) {
-        uint16_t lowColor = phase ? GC9A01A_RED : GC9A01A_DARKGREY;
-        drawGasText(93, 196, 1, 54, lowColor, s_lastGasLow, &s_lastLowColor, "LOW FUEL");
-    } else {
-        drawGasText(93, 196, 1, 54, GC9A01A_BLACK, s_lastGasLow, &s_lastLowColor, "");
-    }
-    if (moved || blinkChange || lowChange) {
-        uint16_t needleColor = low ? (phase ? GC9A01A_RED : GC9A01A_DARKGREY) : GC9A01A_CYAN;
-        drawGasNeedle(deg, needleColor);
-    }
-    s_gasTft->fillCircle(GAS_CX, GAS_CY, 4, GC9A01A_RED);
-    s_needleDrawn = true;
-    s_needleDeg = deg;
-    s_lowWas = low;
-    s_blinkPhase = phase;
-
+    /* "100%" at size 4 is 4 x 24 = 96 px, centred at x = 72. The clear must
+     * cover the widest in-spec string or a shorter one leaves an ink ghost (the
+     * old L7 defect), so 112 px. Vertical clear is 178..216, which clears the
+     * bar at 144 and the miles at 226 with no overlap on either side. */
     snprintf(buf, sizeof buf, "%d%%", s_gasDisp);
     uint16_t pctColor = low ? (phase ? GC9A01A_RED : GC9A01A_DARKGREY) : GC9A01A_CYAN;
-    drawGasText(88, 208, 2, 68, pctColor, s_lastGasPct, &s_lastPctColor, buf);
+    drawGasText(72, 180, 4, 112, pctColor, s_lastGasPct, &s_lastPctColor, buf);
 
-    /* WHICH MID CURVE IS IN EFFECT used to be shown here as a CAL / CAL* badge.
-     *
-     * Removed at the owner's request: it told the operator which shape the
-     * mid anchors have, and the operator does not need telling - they know when
-     * the tank is empty and when it is full, which is the information the
-     * calibration actually depends on. A permanent element on a gauge you
-     * already know is a cost, not a free diagnostic.
-     *
-     * The traceability that the badge was invented for is on the console: `Q`
-     * prints the live anchor table. Serial is the right place for a one-time
-     * calibration fact; the gauge is for driving.
-     *
-     * Nothing needs a badge now anyway. The whole auto-calibration feature went
-     * with it (2026-10-02): nothing moves an anchor on its own, so there is no
-     * "which curve is in effect" question left to answer. */
-
+    /* Low-fuel warning on the number itself, rather than on a bezel ring.
+     * The warning PATH is unchanged from the old ring version -- same
+     * gasPctFromFilt() against the same g_cfg.lowFuelPct -- so this does not
+     * resolve the standing question of whether lowFuelPct (shipped default 20,
+     * docs say 6) sits inside the 0%/8.4% dead zone. It only changes where the
+     * alarm is drawn. */
+    s_lowWas = low;
+    s_blinkPhase = phase;
 }
 
+/* GAS PANEL DISABLED 2026-10-09, at the owner's decision. One round panel.
+ *
+ * WHY, as measured rather than argued:
+ *   - Both panels share SCLK15/MOSI16. Separate CS (17/18 vs 2/21) and separate
+ *     DC - that part was never the problem, and it is not what is being claimed
+ *     here.
+ *   - The idle panel was CLEAN through the entire investigation: on the bench,
+ *     off the car, before and after the CS/DC swap, with new caps and a new
+ *     ground wire.
+ *   - The gas panel garbled through ALL of it. Then the entire gauge was deleted
+ *     and replaced with three words - a percentage and a mileage figure, drawn
+ *     only when the digits actually change. IT STILL GARBLED.
+ *   - That is the decisive step. Draw volume is excluded: the gas panel was
+ *     doing almost nothing and failed anyway, while the idle panel does far more
+ *     and is fine. The remaining difference is the gas panel's own wire run onto
+ *     the shared bus, and only GPIO22/23 are free so the bus cannot be split.
+ *   - Hardware SPI is not an escape: VSPI needs IO18/19/23, and 18 and 19 are
+ *     already the gas DC and the IAC MOSFET gate.
+ *
+ * WHAT THIS DOES NOT TOUCH: gas measurement and telemetry are untouched. The A4
+ * front end, the 20 Hz sampler, the EMA filter, the 13-anchor table, the float
+ * history and `f[5]` in the 0xB0 ESP-NOW payload all keep running exactly as
+ * before - the dash still gets the live percentage. Only the second SCREEN is
+ * gone. The intent is to put a gas readout on the dash instead.
+ *
+ * Note CS2/DC21 (GAS_CS/GAS_DC) are left claimed by pinOk()/pinAliasFree() even
+ * though nothing drives them now. That is deliberate and fail-safe: reclaiming
+ * those pins for a relay would put coil edges on a wire still soldered to a
+ * panel. Remove the wiring first if they are ever to be freed.
+ *
+ * To bring the panel back, delete this constant and nothing else - the renderer,
+ * the draw path and the re-init steps are all still in the file. */
+static constexpr bool GAS_TFT_ENABLED = true;
+
 static void initGasTft() {
+    if (!GAS_TFT_ENABLED) return;
     if (!g_cfg.tftEnable) return;
     if (s_gasTft == nullptr) {
-        // PINS SWAPPED: gas renderer now drives the screen on the idle-CS/DC
-        // (CS17/DC18). Idle renderer took over GAS_CS2/DC21 in initTft().
-        s_gasTft = new Adafruit_GC9A01A(g_cfg.pin.tftCs, g_cfg.pin.tftDc, GAS_MOSI, GAS_SCLK, -1);
+        // The surviving panel is the CS17/DC18 one, and it now shows GAS. The
+        // panel on GAS_CS2/DC21 is not driven at all.
+        s_gasTft = new Adafruit_GC9A01A(g_cfg.pin.tftCs, g_cfg.pin.tftDc,
+                                        GAS_MOSI, GAS_SCLK, -1);
     }
     s_gasTft->begin();
     s_gasTft->setRotation(1);
@@ -2059,11 +2129,20 @@ static void teardownTft() {
     if (s_gasTft) { delete s_gasTft; s_gasTft = nullptr; }
 }
 
+/* IDLE RENDERER OFF 2026-10-09. The single surviving panel shows GAS, so there
+ * is nothing left for this one to drive. It stays in the file because the RPM /
+ * duty / CLT / mode face is the thing intended to move to the DASH, and porting
+ * it there means porting this code, not rewriting it.
+ *
+ * Guarded here AND in the re-init state machine below. Both gates are needed:
+ * setup() calls initTft() directly, the state machine does not, and a half-gated
+ * pair is exactly the split-brain that puts a renderer on a panel nothing else
+ * is using. */
+static constexpr bool IDLE_TFT_ENABLED = false;
+
 static void initTft() {
-    if (g_cfg.tftEnable) {
+    if (IDLE_TFT_ENABLED && g_cfg.tftEnable) {
         if (s_tft == nullptr) {
-            // PINS SWAPPED: idle renderer now drives the screen on the gas-CS/DC
-            // (CS2/DC21). Gas renderer took over the idle CS17/DC18 in initGasTft().
             s_tft = new Adafruit_GC9A01A(GAS_CS, GAS_DC, g_cfg.pin.tftMosi, g_cfg.pin.tftSclk, -1);
         }
         s_tft->begin();
@@ -2144,14 +2223,15 @@ static void tftReinitRequest() {
 
 static void tftIdleAlloc() {
     if (s_tft == nullptr) {
-        // PINS SWAPPED: idle renderer drives the gas-CS/DC (CS2/DC21); the gas
-        // renderer takes the idle CS17/DC18.
-        s_tft = new Adafruit_GC9A01A(GAS_CS, GAS_DC, g_cfg.pin.tftMosi, g_cfg.pin.tftSclk, -1);
+        // Reverted 2026-10-09: idle renderer on the configurable pair (CS17/DC18),
+        // gas renderer on GAS_CS2/DC21. Must match initTft()/initGasTft()
+        // exactly or a re-init lands the renderers on the wrong panels.
+        s_tft = new Adafruit_GC9A01A(g_cfg.pin.tftCs, g_cfg.pin.tftDc, g_cfg.pin.tftMosi, g_cfg.pin.tftSclk, -1);
     }
 }
 static void tftGasAlloc() {
     if (s_gasTft == nullptr) {
-        s_gasTft = new Adafruit_GC9A01A(g_cfg.pin.tftCs, g_cfg.pin.tftDc, GAS_MOSI, GAS_SCLK, -1);
+        s_gasTft = new Adafruit_GC9A01A(GAS_CS, GAS_DC, GAS_MOSI, GAS_SCLK, -1);
     }
 }
 
@@ -2196,6 +2276,11 @@ static void tftReinitStep() {
             else                 tftReinitDone();
             return;
         case TFT_STEP_IDLE_ALLOC:                    // new(): ~0 ms, no SPI
+            /* Skipped when the idle renderer is off (see IDLE_TFT_ENABLED).
+             * Stepping through begin()/drawGaugeFrame() for a panel nobody is
+             * using costs ~480 ms of blocking for nothing, and s_tft would be
+             * left allocated on a panel that must stay untouched. */
+            if (!IDLE_TFT_ENABLED) { s_tftStep = TFT_STEP_GAS_ALLOC; return; }
             tftIdleAlloc();
             s_tftStep = TFT_STEP_IDLE_BEGIN;
             return;
@@ -3692,15 +3777,16 @@ static bool pinAliasFree(uint8_t p, int skip_idx, uint8_t assigning) {
      *
      * The four hardcoded GAS_* constants below are only HALF the display's pin
      * set, and adding them alone would still be incomplete: the two renderers
-     * deliberately CROSS their roles (initTft() builds
-     *   Adafruit_GC9A01A(GAS_CS, GAS_DC, tftMosi, tftSclk, -1)
+     * take one CS/DC pair each and BOTH clock out of the shared bus
+     * (initTft() builds
+     *   Adafruit_GC9A01A(tftCs, tftDc, tftMosi, tftSclk, -1)
      * and initGasTft() builds
-     *   Adafruit_GC9A01A(tftCs, tftDc, GAS_MOSI, GAS_SCLK, -1)),
-     * so the idle display also clocks out of tftMosi/tftSclk and the gas
-     * display also clocks out of GAS_MOSI/GAS_SCLK. The full live signal set is
+     *   Adafruit_GC9A01A(GAS_CS, GAS_DC, GAS_MOSI, GAS_SCLK, -1)),
+     * with GAS_MOSI/GAS_SCLK == 15/16 == tftMosi/tftSclk. The full live
+     * signal set is
      *
-     *   idle display : 2, 21, tftMosi, tftSclk
-     *   gas  display : tftCs, tftDc, 16, 15
+     *   idle display : tftCs, tftDc, 16, 15
+     *   gas  display : 2, 21, 16, 15
      *
      * i.e. all eight pins, four hardcoded and four remappable, and every one of
      * the eight now has a check against it here.
@@ -4040,8 +4126,11 @@ void loop() {
     // but NOT this one.
     if (g_cfg.tftEnable && now - tftLast >= 100 && s_tftStep == TFT_IDLE) {
         tftLast = now;
-        updateDisplay();
-        updateGasDisplay();
+        /* Both renderers are gated here as well as at init. updateDisplay() only
+         * checks s_tft != nullptr and would keep drawing into a panel the idle
+         * renderer is no longer allowed to own. */
+        if (IDLE_TFT_ENABLED) updateDisplay();
+        if (GAS_TFT_ENABLED)  updateGasDisplay();
     }
 
     // Advance a queued TFT re-init by ONE step. Placed AFTER updateOutputs() so
