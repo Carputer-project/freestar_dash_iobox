@@ -1904,55 +1904,27 @@ static void drawGasRing(float fromDeg, float toDeg, int bandLoPct, int bandHiPct
  *
  * What was removed and what still runs:
  *   - s_gasDisp / gasAngleDeg / drawGasNeedle / drawGasRing / drawGasMarks /
- *     drawGasMajorTick / drawGasText / drawGasValue  -> all now unused by the
- *     gas panel. They are left in place, not deleted: the ring/band/needle
- *     helpers are ~150 lines and the band logic in updateGasDisplay() is the
- *     only consumer of s_bandMin/s_bandMax. Deleting them is a separate,
- *     larger change and should not ride along with a fault fix.
+ *     drawGasMajorTick / drawGasText / drawGasValue  -> the ring/band/needle
+ *     helpers are unused by the current bar face. They are left in place, not
+ *     deleted: the ring/band/needle helpers are ~150 lines and the band logic
+ *     in updateGasDisplay() is the only consumer of s_bandMin/s_bandMax.
+ *     Deleting them is a separate, larger change and should not ride along
+ *     with a fault fix.
  *   - The float history (s_gasHist) still accumulates in NVS from the 20 Hz
- *     sampler. It is simply not displayed. Nothing is lost by re-adding it. */
-/* VERTICAL BAR, 2026-10-09, at the owner's request. Single panel now (see
- * GAS_TFT_ENABLED / IDLE_TFT_ENABLED above), so this face has the whole 240x240
- * to itself.
+ *     sampler. It is simply not displayed. Nothing is lost by re-adding it.
  *
- * Geometry. The active area is round, ~32.4 mm across, so the usable rectangle
- * is roughly x 34..206 / y 34..206 and anything outside it is clipped by the
- * round mask. The bar is kept well inside:
- *
- *   bar column : x 100..140 (40 px wide), y 52..172 (120 px tall)
- *   full scale = 120 px, drawn from the BOTTOM up
- *
- * Nothing OVERLAPS the bar column. That is deliberate, and it cost one rewrite:
- * the first attempt put the percentage inside the bar so it read against the
- * fill, but drawGasText() clears its own background, so the number punched a
- * black hole in the fill - and when the level DROPPED, the shrink repaint
- * (which has to repaint the vacated track above the new top) ran over that same
- * region and erased the number, which then could not be redrawn because
- * drawGasText() had already stored the new string and would early-return. The
- * text is delta-gated, so nothing would have brought it back until the
- * percentage changed again. Bar and text each own their own pixels.
- *
- * Draw cost, which is the reason this face exists: the static furniture (bezel,
- * outline, empty track, "GAS") is painted ONCE in drawGasFrame(). The
- * per-update path paints a single fillRect of the fill column, and only when the
- * integer height changes. At a steady level that is zero pixels - it is not the
- * 10 Hz busy-drawing the old radial gauge was.
- *
- * s_gasBarH is the height already painted; -1 forces the first update to draw.
- * A growing fillRect cannot undo itself, so a SHRINK repaints the vacated track
- * above the new top, or every drop would leave a bright ghost above the level. */
-/* NUMBERS ONLY, size 2, centred. Back to the face that was verified clean.
- *
- * Two intermediate versions were tried and rejected on the panel, both on
- * 2026-10-09: a horizontal bar with the number inside it, and a full-height
- * column across the whole disc. The column was described as looking grey -
- * a 200x240 px DARKGREY track is most of the screen, so it read as a grey
- * block rather than a gauge. Neither added anything the number does not say,
- * and both cost pixels on a software-SPI bus.
- *
- * Kept from the number version: a bezel ring, "GAS", the percentage centred,
- * the miles estimate below it. Kept OUT: the bar, the ring ticks, the 1/4-1/2-3/4
- * labels, the float-history band and the needle. */
+ * The face went through four versions on 2026-10-09, and three were rejected
+ * on the panel, not on paper:
+ *   VERTICAL BAR   -> "look grey": a 200x240 px DARKGREY track is most of the
+ *                     screen, reads as a block rather than a gauge.
+ *   NUMBERS ONLY   -> the face that was verified clean (bezel ring, "GAS",
+ *                     centred percentage, miles below).
+ *   HORIZONTAL, number INSIDE the bar -> real bug: drawGasText() clears its
+ *                     own background, punching a hole in the fill, and the
+ *                     shrink repaint then erased the number permanently (see
+ *                     the overlap rule in the HORIZONTAL BAR block below).
+ * The current face is the horizontal bar with the text clear of it. */
+
 /* HORIZONTAL BAR, 2026-10-09. Sideways fill, left to right.
  *
  * Geometry. The panel is a 240x240 disc, so a full-width rect only fits inside
