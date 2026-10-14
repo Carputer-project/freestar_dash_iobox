@@ -241,8 +241,9 @@ static constexpr uint16_t CFG_MAGIC = 0x4971;   // 0x4970→0x4971: wipe poisone
  * 13 anchors instead of 9 (2026-10-04): more anchors means each segment
  * assumes the sender is linear over a SHORTER span, so the error from the
  * sender's real curve is smaller. Span per segment went 2610 mV -> 1740 mV.
- * Only the two ends (3228 full, 24109 empty) are measured; the interior
- * values are exact even divisions of that span.
+ * Only the two ends are measured against this sender; the interior
+ * values are exact even divisions of that span. (FULL = 3228. The EMPTY end
+ * has moved with re-measurements: 24109 -> 19967 -> 18000, see kGasStockMv.)
  *
  * The tenths step MUST be rounded, not truncated. `GAS_TENTHS / GAS_SEG` is
  * integer division: at 9 anchors 1000/8 = 125 exactly, so it was harmless,
@@ -258,17 +259,18 @@ static constexpr int32_t gasPctTenths(uint8_t i) {
          : GAS_TENTHS - (int32_t)((i * GAS_TENTHS + GAS_SEG / 2) / GAS_SEG);
 }
 
-/* Re-derived 2026-10-08. The EMPTY end was 24109, recorded on a day when the
- * sender's resting position at empty was different. With the tank genuinely
- * empty the sender now reads ~19967 mV (3 x 120 s logs, 262 samples, medians
- * 20021/19959/19967). The old table therefore displayed 18-23% on an empty
- * tank and threw away ~4100 mV of real sender travel.
+/* Re-derived 2026-10-11. EMPTY end moved to 18000 mV, just under the lowest
+ * empty-tank reading ever observed (18239 mV): every low-tank reading
+ * (18239..21332, 262 samples across 3 x 120 s logs) then reads exactly 0%.
+ * Previous EMPTY was 19967 (the median of those runs) with a 0% cut at index
+ * 11 = 18572, which made the scale jump 8% -> 0% and skipped the numbers 1-7
+ * entirely.
  *
  * FULL is UNCHANGED at 3228 - only the empty end moved. 13 anchors evenly
- * divided across the 3228..19967 span ((19967-3228)/12 = 1394.9 mV per
- * segment). The 0% cliff sits at index 11 = 18572, so every reading at or
- * above 18572 - which is the entire observed empty-tank distribution
- * (18239..21332, median 19967) - reads 0%.
+ * divided across the 3228..18000 span ((18000-3228)/12 = 1231 mV per
+ * segment). gasPctFromMv maps the LAST segment continuously (8%..0%) and
+ * returns 0 only above the last anchor, so the scale counts down through
+ * every percent on the way to empty and no bottom reading is squashed.
  *
  * This is the FALLBACK table: the box uses it whenever the stored calibration
  * is degenerate. The box in the car stores only 9 of 13 anchors with the last
@@ -276,8 +278,8 @@ static constexpr int32_t gasPctTenths(uint8_t i) {
  * span" and ran on this table. That made this the number that actually decided
  * the gauge, not the stored one. */
 static constexpr uint16_t kGasStockMv[GAS_ANCHORS] = {
-    3228, 4623, 6018, 7413, 8808, 10203, 11598,
-    12992, 14387, 15782, 17177, 18572, 19967
+    3228, 4459, 5690, 6921, 8152, 9383, 10614,
+    11845, 13076, 14307, 15538, 16769, 18000
 };
 struct Cfg {
     uint16_t magic = CFG_MAGIC;
@@ -884,7 +886,14 @@ static void espnowSendStatus() {
     uint8_t f[19] = {0};
     f[0] = FRAME_STATUS;
     uint8_t latch = 0;
-    for (uint8_t i = 0; i < 4; i++) if (s_anLatch[i]) latch |= (1u << i);
+    for (uint8_t i = 0; i < 4; i++) {
+        bool on = s_anLatch[i];
+        /* A3 (high beam) is reported INVERTED to the dash. The relay the user
+         * fitted switches the opposite sense into A3, so a latched A3 means the
+         * car's high beam is OFF. Flip bit 2 only; A1/A2 indicators untouched. */
+        if (i == 2) on = !on;
+        if (on) latch |= (1u << i);
+    }
     f[1] = latch;
     f[2] = (uint8_t)constrain((int)s_speedMph, 0, 255);
     f[3] = ++s_seq;
@@ -1542,14 +1551,14 @@ static int gasPctFromMv(int16_t mv) {
 
     if (c[0] < c[GAS_SEG]) {   // normal slope: low mV = full, high mV = empty
         if (mv <= c[0]) return 100;
-        /* Empty is the SECOND-TO-LAST anchor, not the last. The sender's real
-         * empty reading is the one that used to land on 8% (22369 on the 13
-         * anchor table), so readings at or above it must read 0% rather than
-         * the 0-8% the final segment would otherwise interpolate. The last
-         * anchor (24109) is left in the table as calibration headroom and is
-         * simply never reached - nothing about the anchors themselves changed,
-         * so Q R still restores the same table. */
-        if (mv >= c[GAS_SEG - 1]) return 0;
+        /* 0% sits at the LAST anchor and the final segment interpolates
+         * 8%..0% continuously - the scale counts through every percent on the
+         * way to empty. Anything above the last anchor (mv > c[GAS_SEG]) falls
+         * through the loop below and reads 0. There is no cut at the
+         * second-to-last anchor anymore: that rule made the scale jump
+         * 8% -> 0% and skipped the numbers 1-7. With EMPTY = 18000 the whole
+         * observed low-tank band (18239..21332) sits above c[GAS_SEG] and
+         * every low-tank reading still reads exactly 0%. */
         for (uint8_t i = 0; i < GAS_SEG; i++) {
             if (mv <= c[i + 1]) {
                 /* Tenths throughout, rounded to nearest at the very end: with
@@ -2039,10 +2048,10 @@ static void updateGasDisplay() {
 
     /* Low-fuel warning on the number itself, rather than on a bezel ring.
      * The warning PATH is unchanged from the old ring version -- same
-     * gasPctFromFilt() against the same g_cfg.lowFuelPct -- so this does not
-     * resolve the standing question of whether lowFuelPct (shipped default 20,
-     * docs say 6) sits inside the 0%/8.4% dead zone. It only changes where the
-     * alarm is drawn. */
+     * gasPctFromFilt() against the same g_cfg.lowFuelPct. Since 2026-10-11 the
+     * scale is continuous (no more 0%/8.4% dead zone - the last segment
+     * interpolates 8%..0%), so a threshold of N fires when the reading is
+     * at or below an actual N%. No hidden inside-the-gap behavior anymore. */
     s_lowWas = low;
     s_blinkPhase = phase;
 }
@@ -2470,7 +2479,13 @@ static bool cmdAllowedFromLink(char key, const String& val) {
         case 'Q':
             return val.length() == 0 ||
                    val.startsWith("D ") || val.startsWith("W ") ||
-                   val.startsWith("M ") || val.startsWith("T ");
+                   val.startsWith("M ") || val.startsWith("T ") ||
+                   // Gas END anchors over the air (user request 2026-10-13). This adds
+                   // remote calibration, so: only FULL/EMPTY endpoints — no mid points
+                   // and no wipe (Q R remains UART-console only). Enabling these means
+                   // a radio neighbor (or spoofed 0xC0) can swing the gauge to any
+                   // reading; accept that risk on your own car. Q 1..9 stays denied too.
+                   val.startsWith("F") || val.startsWith("E");
         // B 0|1|T    buzzer off / on / one test beep — all dash buttons.
         // B L (continuous horn until stopped) is not; the dash has no such
         // button, so refusing it costs nothing.
@@ -3047,39 +3062,25 @@ static void handleCommand(const String& line) {
                 saveCfg();
                 /* Printed from the table itself, not hardcoded. The literal here
                  * used to say E=24109 and survived the 2026-10-08 re-derivation
-                 * that moved EMPTY to 19967 - a message that contradicted the
+                 * that moved EMPTY to 19967 (then 18000 on 2026-10-11) - a
+                 * message that contradicted the
                  * table it had just written is exactly the kind of thing the
                  * next session reads as truth. */
                 Serial.printf("gas cal + history reset to measured default (F=%u E=%u) - no SET FULL/EMPTY needed on this car\n",
                               kGasStockMv[0], kGasStockMv[GAS_SEG]);
                 break;
             }
-            if (val == "F" || val == "E" ||
-                (val.length() == 1 && val[0] >= '1' && val[0] <= '9')) {
-                /* Table anchors: slot0 = FULL .. slot GAS_SEG = EMPTY. The
-                 * sender's slope is read at cal time (see gasPercent) — low mV =
-                 * full OR high mV = full, both supported.
-                 *
-                 * Q 1 / 2 / 3 keep their original meaning — the 1/4, 1/2 and
-                 * 3/4 TANK points. Those are slot GAS_SEG/2, GAS_SEG/4 and
-                 * GAS_SEG/4*3, written as GAS_SEG - 2*d so they follow whatever
-                 * anchor count is compiled in: with 9 anchors they are slots 6,
-                 * 4 and 2; with 13 they are slots 9, 6 and 3.
-                 *
-                 * Q 4..9 name the remaining interior anchors directly,
-                 * slot == digit. The digit range used to stop at 7, which was
-                 * every interior slot when GAS_ANCHORS was 9 (slots 1..7); at
-                 * 13 anchors the interior runs 1..12, so 8/9/0 are needed for
-                 * slots 10/11/12 and anything above is unreachable from the
-                 * console (Q R still restores the full default table). */
-                uint8_t slot;
-                if (val == "F")      slot = 0;
-                else if (val == "E") slot = GAS_SEG;
-                else {
-                    uint8_t d = (uint8_t)(val[0] - '0');
-                    slot = (d <= 3) ? (uint8_t)(GAS_SEG - 2 * d) : d;
-                }
+            // Gas calibration by ENDS only: no mid-point anchors. Q F / Q E
+            // re-linearise the whole table as a single straight line between
+            // FULL and EMPTY. Any digit-only "Q n" requests an interior slot and
+            // is not supported any more.
+            if (val == "F" || val == "E") {
+                /* Table anchors: only two real anchors (slot0 = FULL,
+                 * slot GAS_SEG = EMPTY). Every interior point is synthetic,
+                 * derived by linear interpolation when an end is set. */
+                uint8_t slot = (val == "F") ? 0 : GAS_SEG;
                 uint16_t raw = readAnalogMv(3);
+
                 // Off-scale rejection (2026-09-20 stuck-at-full bug): an open
                 // sender reads ~60k (clamped to 60000), a dead short ~0.
                 // Recording either into an anchor poisons the table — a huge
@@ -3123,7 +3124,7 @@ static void handleCommand(const String& line) {
                     if (span) {
                         for (uint8_t j = 1; j < GAS_SEG; j++)
                             g_cfg.gasCalMv[j] = (uint16_t)((int32_t)g_cfg.gasCalMv[0] + span * j / GAS_SEG);
-                        Serial.println("gas mids re-linearised; refine with Q 1..7 after F/E");
+                        Serial.println("gas mids re-linearised as a straight line; only FULL and EMPTY are used");
                     }
                 }
                 s_gasFilt = -1; gasSampleMv();      // reseed filter after cal change
