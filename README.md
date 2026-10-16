@@ -1,7 +1,9 @@
-# esp32_ms_iobox3 — MicroSquirt I/O Box (ESP-NOW era)
+# Freestar Dash I/O Box (ESP-NOW era)
+
+<img src="freestar_dash_logo.png" alt="Freestar Dash" width="700">
 
 Actuator + analog-input box for the MS2/Extra dash
-([esp32_ms_dash](https://github.com/Carputer-project/esp32_ms_dash)). Runs on an
+([freestar_dash](https://github.com/Carputer-project/freestar_dash)). Runs on an
 ESP32 WROOM-32 dev board with two GC9A01A 1.28" round displays.
 
 **Architecture note:** the original v3 design read the MicroSquirt CAN bus
