@@ -12,7 +12,8 @@ zero value reading to 8... why the fuck skip numbers."* Made:
    18239 — so every recorded low-tank reading 18239..21332 still reads 0%).
 2. Removed the second-to-last-anchor 0% cut in `gasPctFromMv` — the last segment now
    interpolates **8%..0% continuously**, so the scale shows every percent (no 1–7 gap) and
-   `Q W N` fires at a real N%. Build verified. **Not yet flashed/verified on the box.**
+   `Q W N` fires at a real N%. Build verified. **Flashed and verified on the box — owner confirms
+   the whole set is flashed and verified (2026-10-15).**
 
 ---
 
