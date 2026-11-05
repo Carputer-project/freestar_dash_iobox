@@ -4,11 +4,12 @@
 #include <WiFi.h>
 #include <Preferences.h>
 #include <SPI.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_GC9A01A.h>
+// Adafruit_GFX.h + Adafruit_GC9A01A.h removed 2026-10-21 (display code removed).
+// See AGENTS.md "iobox3 GC9A01A Display (REMOVED)" for setup documentation.
 // esp_task_wdt_init()/esp_task_wdt_status() are not reachable via Arduino.h;
 // esp32-hal.h declares only the core helpers (enableLoopWDT et al).
 #include <esp_task_wdt.h>
+#include <esp_system.h>   // esp_reset_reason()
 
 // Old CAN pins (GPIO4/5) are now FREE — the SN65HVD230 transceiver is gone.
 // PIN_LED retired: GPIO2 is owned by the gas-gauge TFT CS (GAS_CS below).
@@ -23,7 +24,7 @@ static constexpr uint8_t PIN_TFT_SCLK_DEF = 15;
 static constexpr uint8_t PIN_TFT_MOSI_DEF = 16;
 static constexpr uint8_t PIN_TFT_CS_DEF   = 17;
 static constexpr uint8_t PIN_TFT_DC_DEF   = 18;
-static Adafruit_GC9A01A* s_tft = nullptr;
+// static Adafruit_GC9A01A* s_tft = nullptr;  // removed 2026-10-21
 
 // Second round display: gas gauge (same GC9A01A). Shares SCLK/MOSI with
 // display1 (software SPI, selected by its own CS). CS2=D2 boots high so the
@@ -32,7 +33,7 @@ static constexpr uint8_t GAS_SCLK = 15;
 static constexpr uint8_t GAS_MOSI = 16;
 static constexpr uint8_t GAS_CS   = 2;
 static constexpr uint8_t GAS_DC   = 21;
-static Adafruit_GC9A01A* s_gasTft = nullptr;
+// static Adafruit_GC9A01A* s_gasTft = nullptr;  // removed 2026-10-21
 
 // Default pin map (iobox3 / v3 board). Runtime-configurable via 'P' command.
 static constexpr uint8_t PIN_IAC_DEF = 19;
@@ -64,7 +65,7 @@ static constexpr uint8_t PIN_O6_DEF  = 25;
 static constexpr uint8_t PIN_O7_DEF  = 23;
 static constexpr uint8_t PIN_BUZZ_DEF = 32;   // only free clean pin on iobox3
 static constexpr uint8_t PIN_LED_DATA_DEF = 4; // old CAN RX pin — free since ESP-NOW migration
-static constexpr uint8_t PIN_SPEED = 5;      // ABS speed input (LM393 -> PCNT) — old CAN TX, free
+static constexpr uint8_t PIN_SPEED = 5;      // C52 gearbox 3-wire Hall sensor via 39k/10k divider + 3.0V zener to GPIO5 (PCNT rising edges) — old CAN TX, free
 
 static constexpr uint8_t  CAN_GROUP_COUNT = 9;   // outpc groups (72 bytes) carried in 0xA0
 static constexpr uint16_t DASH_TX_MS = 100;
@@ -339,7 +340,7 @@ struct Cfg {
     // records the anchor through the same path (absorbs the offset).
     uint16_t  gasCalMv[GAS_ANCHORS] = {
         3228, 5838, 8448, 11058, 13668, 16279, 18889, 21499, 24109
-    };  // FULL .. EMPTY, 12.5% per segment
+    };  // FULL .. EMPTY, 13 anchors = 12 segments = 8.33% per segment
     uint8_t  gasDamp = 5;       // EMA smoothing 0(raw)..15 — tames small-signal sender jitter; on-car default 5 (2026-09-21)
     uint8_t  lowFuelPct = 20;   // at/below this % the gas gauge flashes red
     uint8_t  gasMpg = 25;       // assumed fuel economy for est. miles remaining
@@ -385,6 +386,28 @@ static volatile bool     s_anyGroupSeen = false;
 
 static constexpr uint8_t ADC_PINS[4] = { PIN_A1, PIN_A2, PIN_A3, PIN_A4 };
 
+/* Per-channel input FRONT END, not a threshold setting.
+ *
+ * The current board (V2, built 2026-10-15) replaces the resistor divider on
+ * A1/A2/A3 with PC817C optocouplers. A4 is STILL the analog fuel-sender
+ * divider and is untouched.
+ *
+ * Opto channel (V2), see how_to_md_files/iobox3_adc_frontend_versions.md:
+ *   car 12V --[2.2k]--> PC817 LED --> car GND     (1N4148 reverse clamp)
+ *   box 3.3V --[10k]--> collector --> GPIO, emitter --> box GND
+ *   Idle (no signal): phototransistor OFF, 10k pulls the GPIO HIGH (3.3 V).
+ *   Signal present:   phototransistor ON,  pulls the GPIO LOW (0 V).
+ *   => ACTIVE-LOW, pure digital. No ADC, no threshold, no floor gate, no
+ *      hysteresis band. Applying the old analog path to it would be doubly
+ *      wrong: the idle 3.3 V sits ABOVE kAnFloorMv so it would latch ON with
+ *      nothing connected, and anThresh is meaningless on a logic input.
+ *
+ * A4 (false) keeps the existing analog divider path exactly as it was.
+ *
+ * Compile-time because the board is fixed per unit. A future mixed board would
+ * move this into Cfg, which changes sizeof(Cfg) and resets stored config. */
+static constexpr bool kAnOpto[4] = { true, true, true, false };
+
 static uint16_t rdU16(const uint8_t* buf, uint8_t off) { return (uint16_t)((buf[off] << 8) | buf[off + 1]); }
 static int16_t  rdS16(const uint8_t* buf, uint8_t off) { return (int16_t)rdU16(buf, off); }
 
@@ -409,7 +432,7 @@ static void setFan(bool on) {
 }
 /* Fan output index, or 0 when there is none. inputForces() takes a target
  * OUTPUT NUMBER (1..7), and the fan used to be written as the literal 7 while
- * setFan() drives g_cfg.fanOut - which DEFAULTS TO 6. So `A1 F 2.5` (documented
+ * setFan() drives g_cfg.fanOut - which DEFAULTS TO 1 (O1/GPIO13, measured 2026-10-04) - it was once 6. So `A1 F 2.5` (documented
  * as "map this input to the fan") set g_cfg.anOut[0] = 6, and the only consumer
  * of that mapping asked inputForces(7). The fan pin was never affected, and the
  * `A1 fan thr=2.5V` confirmation named the mapping as if it had been.
@@ -497,7 +520,7 @@ static uint16_t readAnalogMv(uint8_t i) {
      * dividers measuring 12 V car signals, so the node sits near 550 mV and every
      * error is multiplied by 22.74. A 5% reference error became a 5% error on the
      * reported source voltage, which is what A1-A3 latch against (2000 mV
-     * default threshold) and what the gas gauge's 5 anchors are recorded in. The
+     * default threshold) and what the gas gauge's 13 anchors are recorded in. The
      * oversample above is kept regardless — that tames noise, which calibration
      * does not. */
     uint32_t sumMv = 0;
@@ -511,7 +534,7 @@ static const char* tgtName(uint8_t t) {
     if (t == 0) return "-";
     /* "fan" is WHATEVER OUTPUT THE FAN IS ON, which is not always 7. It was
      * hardcoded to 7, so every confirmation line named the wrong thing as soon
-     * as `Y <k>` moved the fan anywhere else - and fanOut defaults to 6. */
+     * as `Y <k>` moved the fan anywhere else - and fanOut defaults to 1. */
     if (t >= 1 && t <= 7 && t == g_cfg.fanOut) return "fan";
     snprintf(buf, sizeof buf, "O%u", t);
     return buf;
@@ -530,8 +553,9 @@ static int8_t s_anForce[4] = { -1, -1, -1, -1 };
 // is selected. Indicators stay active-high (12V flasher pulses). Polarity
 // is per-channel, stored under its own NVS key ("anpol") so toggling it
 // never resets Cfg or gas calibration. Set via `A<n> L<v>` / `A<n> H<v>`.
-// NOTE: an UNCONNECTED input reads 0V and will latch in low mode — only
-// use low mode on channels whose car wire actually idles at ~12V.
+// NOTE: an UNCONNECTED input reads ~3228 mV (the undriven floor), not 0 V. Low mode
+// latches at or below its ceiling, so keep the ceiling UNDER ~3.2 V (A3 uses 1.5 V)
+// or an unplugged input reads as latched.
 static bool s_anLow[4] = { false, false, false, false };
 
 static void saveAnPol() {
@@ -584,30 +608,43 @@ static void updateAnalogLatch() {
             continue;
         }
         if (!g_cfg.anEnable[i]) { s_anLatch[i] = false; candSince[i] = now; continue; }
-        int16_t t = (int16_t)g_cfg.anThresh[i];
-        int16_t mv = (int16_t)min(readAnalogMv(i), (uint16_t)32767);   // clamp: >32767 would cast negative
         bool raw;
-        /* The hysteresis reference is candState, NOT s_anLatch.
-         *
-         * s_anLatch is forced from outside this function (`A<n> D1/D0`, and
-         * the !anEnable clear above); candState is written nowhere else. Any
-         * disagreement between the two desynchronises the release test from
-         * the set test, and since it is the release edge that a noisy input
-         * keeps re-crossing, the latch then cannot move in either direction.
-         * candState is the state candSince is actually measuring, so it is the
-         * correct reference for both edges. */
-        if (s_anLow[i]) {
-            // GND-switched line: set at/below threshold, release above +band
-            raw = candState[i] ? (mv < t + kAnHystMv) : (mv <= t);
-        } else {
-            /* Active-high: latch on rise above threshold, release below -band.
+        if (kAnOpto[i]) {
+            /* PC817 digital opto (A1/A2/A3 on the V2 board): ACTIVE-LOW.
+             * Signal present pulls the GPIO LOW; idle is HIGH through the 10k
+             * pull-up. No threshold, no floor gate, no hysteresis - this is a
+             * clean logic level. The 100 ms debounce below still applies, so a
+             * flasher/indicator pulse still has to hold to latch.
              *
-             * kAnFloorMv is a hard gate, and it is the whole point: an
-             * UNDRIVEN input reads ~3228 mV, not 0, so a threshold under the
-             * floor reports "connected and active" for a channel with nothing
-             * on it. That is what pinned the indicators and high beam on. */
-            int16_t lo = t > kAnHystMv ? t - kAnHystMv : 0;
-            raw = (mv >= kAnFloorMv) && (candState[i] ? (mv > lo) : (mv >= t));
+             * s_anLow[] is intentionally ignored here: an opto channel's
+             * polarity is fixed by the hardware (LOW = active), and the H/L
+             * command forms exist for the old divider channels. */
+            raw = (digitalRead(ADC_PINS[i]) == LOW);
+        } else {
+            int16_t t = (int16_t)g_cfg.anThresh[i];
+            int16_t mv = (int16_t)min(readAnalogMv(i), (uint16_t)32767);   // clamp: >32767 would cast negative
+            /* The hysteresis reference is candState, NOT s_anLatch.
+             *
+             * s_anLatch is forced from outside this function (`A<n> D1/D0`, and
+             * the !anEnable clear above); candState is written nowhere else. Any
+             * disagreement between the two desynchronises the release test from
+             * the set test, and since it is the release edge that a noisy input
+             * keeps re-crossing, the latch then cannot move in either direction.
+             * candState is the state candSince is actually measuring, so it is the
+             * correct reference for both edges. */
+            if (s_anLow[i]) {
+                // GND-switched line: set at/below threshold, release above +band
+                raw = candState[i] ? (mv < t + kAnHystMv) : (mv <= t);
+            } else {
+                /* Active-high: latch on rise above threshold, release below -band.
+                 *
+                 * kAnFloorMv is a hard gate, and it is the whole point: an
+                 * UNDRIVEN input reads ~3228 mV, not 0, so a threshold under the
+                 * floor reports "connected and active" for a channel with nothing
+                 * on it. That is what pinned the indicators and high beam on. */
+                int16_t lo = t > kAnHystMv ? t - kAnHystMv : 0;
+                raw = (mv >= kAnFloorMv) && (candState[i] ? (mv > lo) : (mv >= t));
+            }
         }
         if (raw != candState[i]) { candState[i] = raw; candSince[i] = now; }
         if (now - candSince[i] >= AN_DEBOUNCE_MS && s_anLatch[i] != raw) s_anLatch[i] = raw;
@@ -630,8 +667,7 @@ static void outputsOff() {
 /* Which PinMap field a caller is about to overwrite, so pinAliasFree() can tell
  * "this pin is already mine" from "this pin is already someone else's".
  * Deliberately a separate parameter from skip_idx - see pinAliasFree(). */
-enum : uint8_t { PINASSIGN_NONE = 0, PINASSIGN_IAC, PINASSIGN_BZ,
-                 PINASSIGN_TFTS, PINASSIGN_TFTM, PINASSIGN_TFTC, PINASSIGN_TFTD };
+enum : uint8_t { PINASSIGN_NONE = 0, PINASSIGN_IAC, PINASSIGN_BZ };
 
 /* True only if s is a complete, non-empty decimal integer (optional leading
  * minus).
@@ -761,7 +797,8 @@ static void applyPinConfig();
 // Both devices stay on a fixed channel (1) so no AP association is required.
 // ---------------------------------------------------------------------------
 static uint8_t  s_seq = 0;
-static volatile float s_speedMph = 0; // ABS speed, mph (0xB0 f[2])
+static volatile float s_speedMph = 0; // speed, mph (0xB0 f[2])
+static float s_pulsesPerMph = 1.5f; // placeholder until calibrated; runtime adjustable via SP command, saved to NVS "spulses2" (C52 3-wire Hall, 4 pulses/rev, 39k/10k + 3.0V zener)
 static void gasSampleMv();     // ADC read + EMA advance; ONCE per loop()
 static int  gasPctFromFilt();  // pure s_gasFilt -> percent mapping
 static void saveCfg();
@@ -871,6 +908,10 @@ static void espnowRecv(const uint8_t* mac, const uint8_t* data, int len) {
 
 static uint32_t s_txB0Count = 0;
 
+static esp_reset_reason_t s_lastResetReason = ESP_RST_UNKNOWN;
+static uint32_t          s_resetCount = 0;
+static uint32_t          s_brownoutCount = 0;
+
 static void espnowSendStatus() {
     // v3 frame: v2 (gas% + per-channel source-mV) + live IAC duty % in [14].
     // Dash reads only [1](latch) and [4](warn) with a len>=8 guard, so the
@@ -883,7 +924,7 @@ static void espnowSendStatus() {
     // computed, latched, beeped and displayed on the box's own panel, and were
     // structurally incapable of reaching the dash. A lean WOT pull past the
     // AFR ceiling lit nothing on the driver's display.
-    uint8_t f[19] = {0};
+    uint8_t f[20] = {0};
     f[0] = FRAME_STATUS;
     uint8_t latch = 0;
     for (uint8_t i = 0; i < 4; i++) {
@@ -900,7 +941,17 @@ static void espnowSendStatus() {
     f[4] = 0;   // warn mask LOW — box no longer computes warnings (dash does)
     f[5] = (uint8_t)constrain(gasPctFromFilt(), 0, 100);
     for (uint8_t i = 0; i < 4; i++) {
-        uint16_t mv = readAnalogMv(i);
+        /* A1/A2/A3 are digital PC817 optos on this board - there is no ADC
+         * channel behind them, so readAnalogMv() would report the GPIO's
+         * floating/rail behaviour, not a measurement. Report the logic level in
+         * the same field the divider version used, so the frame layout and the
+         * dash's byte offsets are unchanged: 0 = LOW (signal present), 3300 =
+         * HIGH (idle). These two numbers are the rail and ground, NOT a reading -
+         * do not treat them as a voltmeter.
+         * A4 (kAnOpto[3] = false) is still a real readAnalogMv() off the fuel
+         * sender and is untouched by this. */
+        uint16_t mv = kAnOpto[i] ? (digitalRead(ADC_PINS[i]) == LOW ? 0 : 3300)
+                                 : readAnalogMv(i);
         f[6 + i * 2]     = (uint8_t)(mv & 0xFF);
         f[6 + i * 2 + 1] = (uint8_t)(mv >> 8);
     }
@@ -916,6 +967,7 @@ static void espnowSendStatus() {
     f[16] = iacMode;
     f[17] = g_cfg.buzzerEnable ? 1 : 0;
     f[18] = 0;  // warn mask HIGH — unused now; byte KEPT so f[19..] stay put
+    f[19] = (uint8_t)s_lastResetReason;  // last reset cause (ESP_RST_*) for dash display
     esp_err_t r = esp_now_send(ESP_NOW_BROADCAST, f, sizeof(f));
     s_txB0Count++;
     if (r != ESP_OK) {
@@ -924,15 +976,13 @@ static void espnowSendStatus() {
 }
 
 // ---------------------------------------------------------------------------
-// Vehicle speed from a 2-wire passive ABS VR sensor (AE111 Corolla). The raw
-// AC sine is converted to a clean digital square wave by an LM393 conditioner
-// on GPIO5 (old CAN TX pin — free). PCNT counts teeth in hardware; every
-// DASH_TX_MS tick the counter delta is accumulated over a 1 s window and
-// converted to mph. The mph value rides in 0xB0 f[2] (previously a spare 0).
-// PULSES_PER_MPH is a place-holder: ~44-tooth front tone ring + ~1.85 m tyre.
-// CALIBRATE after install: drive a measured distance and set the constant
-// from pulses-per-mile (= pulses/km * 1.609). See abs_speed_sensor.md.
-static constexpr float   PULSES_PER_MPH = 10.6f;
+// Vehicle speed from a Toyota C52 3-wire Hall sensor (4 pulses/rev) on GPIO5
+// (old CAN TX pin — free). Signal fed through 39k/10k divider + 3.0V zener to
+// ground into GPIO5. No LM393, no connection to 3.3V/5V rail. PCNT counts
+// rising edges in hardware (filter ~1.25 µs), every DASH_TX_MS accumulated over
+// a 1 s window -> mph in 0xB0 f[2]. PULSES_PER_MPH = Hz/mph, runtime adjustable
+// via 'SP' command (saved to NVS "spulses2"). Calibration: 4 × sensor revs/mile
+// / 3600; sensor revs/mile = tire_revs/mile × final_drive × (drive/driven).
 static constexpr pcnt_unit_t SPEED_PCNT_UNIT = (pcnt_unit_t)1;   // free (no other PCNT use)
 static constexpr int16_t SPEED_PCNT_H_LIM = 32767;
 // No s_pcntLast: with M3 the PCNT counter is cleared after every read and
@@ -958,8 +1008,8 @@ static void speedInit() {
     pcnt_counter_pause(SPEED_PCNT_UNIT);
     pcnt_counter_clear(SPEED_PCNT_UNIT);
     pcnt_counter_resume(SPEED_PCNT_UNIT);
-    Serial.printf("speed: PCNT ch on GPIO%d ready (pulses/mph placeholder %.1f)\n",
-                  (int)PIN_SPEED, (double)PULSES_PER_MPH);
+    Serial.printf("speed: PCNT ch on GPIO%d ready (pulses/mph %.1f, Hall C52 4p/rev)\n",
+                  (int)PIN_SPEED, (double)s_pulsesPerMph);
 }
 
 // dtMs between calls (call from the 10 Hz dash tick). Untouched when the
@@ -985,9 +1035,17 @@ static void speedTick(uint32_t dtMs) {
     } else {
         s_speedWinMs += dtMs;  // keep the window advancing even while stopped
     }
+    static uint32_t s_speedPrintMs = 0;
+    static uint32_t s_speedPulsesTotal = 0;
+    if (delta > 0) s_speedPulsesTotal += (uint32_t)delta;
+    s_speedPrintMs += dtMs;
+    if (s_speedPrintMs >= 1000) {
+        Serial.printf("speed_pulses/s=%u total=%u\n", (unsigned)s_pcntAcc, (unsigned)s_speedPulsesTotal);
+        s_speedPrintMs = 0;
+    }
     if (s_speedWinMs >= 1000) {
         float hz = (float)s_pcntAcc * 1000.0f / (float)s_speedWinMs;
-        s_speedMph = hz / PULSES_PER_MPH;
+        s_speedMph = hz / s_pulsesPerMph;
         s_pcntAcc = 0;
         s_speedWinMs = 0;
     }
@@ -1235,7 +1293,7 @@ static void updateOutputs() {
     // runs hotter than 180 nominal in any mode.
     if (cltOk && clt >= g_cfg.fanOnTemp) fanOn = true;
     // Fan-run follow: `A<n> F <v>` maps an analog input onto g_cfg.fanOut. This
-    // was the literal 7 while fanOut DEFAULTS TO 6, and the output loop below
+    // was the literal 7 while fanOut DEFAULTS TO 1 (once 6), and the output loop below
     // `continue`s past fanOut so it never evaluated inputForces(6) either - the
     // documented fan mapping did nothing at all. fanOutIdx() is the one place
     // that decides which output is the fan.
@@ -1382,113 +1440,38 @@ static void updateBuzzer() {
         digitalWrite(g_cfg.pin.buzz, on ? LOW : HIGH);   // INVERTED: LOW = sound
 }
 
-static void drawGaugeFrame() {
-    s_tft->fillScreen(GC9A01A_BLACK);
-    s_tft->drawCircle(120, 120, 119, GC9A01A_NAVY);
-    s_tft->drawCircle(120, 120, 118, GC9A01A_DARKGREY);
-    s_tft->setTextColor(GC9A01A_CYAN);
-    s_tft->setTextSize(2);
-    s_tft->setCursor(96, 20);
-    s_tft->print("IDLE");
-    s_tft->setTextColor(GC9A01A_LIGHTGREY);
-    s_tft->setTextSize(1);
-    s_tft->setCursor(40, 130); s_tft->print("RPM");
-    s_tft->setCursor(108, 130); s_tft->print("TGT");
-    s_tft->setCursor(40, 168); s_tft->print("CLT");
-    s_tft->setCursor(108, 168); s_tft->print("MODE");
-}
-
-static char s_lastDuty[8] = "";
-static char s_lastRpm[8] = "";
-static char s_lastTgt[8] = "";
-static char s_lastClt[8] = "";
-static char s_lastMode[8] = "";
-static char s_lastStat[24] = "";
-
-static void drawValue(int16_t x, int16_t y, uint8_t size, uint16_t color,
-                      uint16_t clearW, char* last, const char* s) {
-    if (strcmp(last, s) == 0) return;
-    strcpy(last, s);
-    s_tft->fillRect(x, y - 2, clearW, size * 8 + 4, GC9A01A_BLACK);
-    s_tft->setCursor(x, y);
-    s_tft->setTextSize(size);
-    s_tft->setTextColor(color);
-    s_tft->print(s);
-}
-
-static void updateDisplay() {
-    if (!g_cfg.tftEnable || s_tft == nullptr) return;
-    /* 24, not 12: the longest string formatted here is "FAN OFF  LINK OK" at
-     * 17 chars + NUL = 18. buf[12] truncated it to "FAN OFF  LI", and the
-     * centring below then used the truncated length, so the one line that
-     * reports both fan state and link state was both wrong and off-centre.
-     * s_lastStat is already 24; drawValue needs room for the widest %s/%d too. */
-    char buf[24];
-
-    uint8_t duty = g_iacDuty;
-    snprintf(buf, sizeof buf, "%u%%", duty);
-    drawValue(48, 48, 6, GC9A01A_CYAN, 144, s_lastDuty, buf);
-
-    /* %lu + cast: g_rpm is uint32_t, which is not `unsigned int` on every target
-     * this compiles for, so %u is a format mismatch rather than a style nit. */
-    snprintf(buf, sizeof buf, "%lu", s_canFresh ? (unsigned long)g_rpm : 0UL);
-    drawValue(40, 146, 2, s_canFresh ? GC9A01A_WHITE : GC9A01A_DARKGREY, 64, s_lastRpm, buf);
-
-    snprintf(buf, sizeof buf, "%d", (int)g_cfg.iacTargetRpm);
-    drawValue(108, 146, 2, GC9A01A_YELLOW, 100, s_lastTgt, buf);
-
-    bool cltOk = groupSeen(2) && g_clt > 100 && g_clt < 3500;
-    /* Explicit branches rather than snprintf() with a non-literal format.
-     * g_clt / 10 is only evaluated on the readable branch here, so a dead
-     * sensor cannot print a garbage temperature alongside the "--". */
-    if (cltOk) snprintf(buf, sizeof buf, "%dF", (int)(g_clt / 10));
-    else        snprintf(buf, sizeof buf, "--");
-    drawValue(40, 184, 2, cltOk ? GC9A01A_YELLOW : GC9A01A_DARKGREY, 64, s_lastClt, buf);
-
-    const char* mode = g_cfg.iacFollow ? "FOLLOW" : (g_cfg.iacAuto ? "AUTO" : "MAN");
-    snprintf(buf, sizeof buf, "%s", mode);
-    drawValue(108, 184, 2, GC9A01A_GREEN, 100, s_lastMode, buf);
-
-    /* On-screen warning text REMOVED with the warning system. This box's own
-     * TFT never showed an engine warning the driver could act on anyway - the
-     * gauge cluster is the display for that, and it computes its own. */
-
-    uint16_t sc;
-    if (!s_canFresh) {
-        sc = GC9A01A_RED;
-        snprintf(buf, sizeof buf, "LINK LOST");
-    } else if (g_cfg.fanOut >= 1 && g_cfg.fanOut <= 7 && digitalRead(g_cfg.pin.out[g_cfg.fanOut - 1])) {
-        sc = GC9A01A_GREEN;
-        snprintf(buf, sizeof buf, "FAN ON  LINK OK");
-    } else {
-        sc = GC9A01A_LIGHTGREY;
-        snprintf(buf, sizeof buf, "FAN OFF  LINK OK");
-    }
-    if (strcmp(s_lastStat, buf)) {
-        strcpy(s_lastStat, buf);
-        s_tft->fillRect(60, 212, 120, 10, GC9A01A_BLACK);
-        s_tft->setCursor((240 - (int)strlen(buf) * 6) / 2, 212);
-        s_tft->setTextSize(1);
-        s_tft->setTextColor(sc);
-        s_tft->print(buf);
-    }
-}
-
 static int16_t s_gasFilt = -1;   // damped reported-mV, -1 = uninitialised
 
+/* BATTERY COMPENSATION (2026-10-22). The fuel sender is now read through a divider
+ * fed from the 12 V supply, so the voltage at the pin is proportional to the
+ * supply: the same tank level reads ~17% higher at 14.4 V (engine running) than
+ * at 12.3 V (engine off). Every reading is therefore scaled to a fixed 13.0 V
+ * reference using the ECU's battery voltage (g_batt, 0.1 V), BEFORE the filter
+ * and BEFORE Q F / Q E record an anchor, so the table and the live readings are
+ * always in the same units and it no longer matters what the battery was doing
+ * when F and E were set. A single ratio is exact for a proportional circuit, so
+ * no lookup table. Falls back to the raw reading until a good battery value has
+ * been seen, and holds the last good one if the link drops or the ECU reports
+ * < 9 V / > 16 V (cranking dips, bad frame). `Q V 0` turns it off, `Q V 1` on
+ * (NVS "gasvcomp", default on). */
+static bool    s_gasVcomp      = true;
+static int16_t s_battHoldDeciV = 0;
+static constexpr int32_t GAS_VREF_DECIV = 130;   // reference = 13.0 V
+
+static uint16_t gasReadMv() {
+    uint16_t raw = readAnalogMv(3);      // A4 = fuel sender (GPIO35)
+    if (!s_gasVcomp) return raw;
+    if (s_canFresh && g_batt >= 90 && g_batt <= 160) s_battHoldDeciV = g_batt;
+    if (s_battHoldDeciV <= 0) return raw;        // no battery value yet: uncorrected
+    uint32_t n = ((uint32_t)raw * (uint32_t)GAS_VREF_DECIV + (uint32_t)s_battHoldDeciV / 2)
+                 / (uint32_t)s_battHoldDeciV;
+    return (uint16_t)(n > 65000 ? 65000 : n);
+}
+
 /* The ONLY function that reads the ADC and advances the EMA. Called exactly
- * once per loop() iteration, from loop(), before any consumer runs.
- *
- * This used to be the first half of gasPercent(), which was called from six
- * places (0xB0 frame, low-fuel buzzer test, gas history, gas display, and two
- * Serial status prints) each of which also advanced the filter. So the damping
- * a caller got depended on how many OTHER callers happened to run first in the
- * same iteration — gasDamp was a per-call divisor, not a time constant, and the
- * effective smoothing changed with which code path was active (display off,
- * link down, a Serial command mid-print). Separating the sampling from the
- * mapping makes the smoothing rate a property of loop() alone. */
+ * once per loop() iteration, from loop(), before any consumer runs. */
 static void gasSampleMv() {
-    uint16_t raw = readAnalogMv(3);   // A4 = fuel sender (GPIO35)
+    uint16_t raw = gasReadMv();   // A4 = fuel sender (GPIO35), battery-normalised
     int32_t f;
     if (g_cfg.gasDamp == 0 || s_gasFilt < 0) f = raw;
     else f = ((int32_t)s_gasFilt * g_cfg.gasDamp + raw) / ((int32_t)g_cfg.gasDamp + 1);
@@ -1523,7 +1506,7 @@ static void gasSampleMv() {
  * inverted branch and put every mid above the FULL anchor. Reachable by simply
  * driving the tank.
  *
- * Single source of truth now. Writes the 5 anchors the gauge really uses into
+ * Single source of truth now. Writes the 13 anchors the gauge really uses into
  * c[] and returns true if the persisted table was REJECTED (c[] then holds
  * kGasStockMv). Callers must take their slope direction from c[], never from
  * g_cfg.gasCalMv.
@@ -1720,343 +1703,8 @@ static void gasHistoryUpdate() {
     }
 }
 
-// Needle gauge: center pivot (120,128), 240 deg sweep (150..390) across the top,
-// leaving a bottom gap for the % / mv text. Ticks are radial lines at 6 deg steps.
-static constexpr int   GAS_CX = 120;
-static constexpr int   GAS_CY = 128;
-static constexpr float GAS_A0  = 150.0f;   // level 0 angle (down-left)
-static constexpr float GAS_A1  = 390.0f;   // level 100 angle (down-right)
-static constexpr float GAS_RIN  = 92.0f;   // tick inner radius
-static constexpr float GAS_ROUT = 108.0f;  // tick outer radius
-static constexpr float GAS_NEEDLE_R = 118.0f;
-static constexpr float GAS_NEEDLE_W = 6.0f; // needle base half-width at pivot
-/* Half-width of the wedge of the ring that the needle's black triangle can
- * reach, in degrees.
- *
- * drawGasNeedle() puts the base corners GAS_NEEDLE_W px either side of the pivot
- * and the apex at GAS_NEEDLE_R, so the triangle subtends a half-angle of
- * atan(GAS_NEEDLE_W / r) at radius r - largest at the INNER edge of the ring,
- * r=86, which is 3.99 deg. The apex coordinate is truncated to int16_t, worth up
- * to about 0.7 deg more. 6.0 is the next whole scale-tick step above that, so
- * the restore wedge cannot under-run the erase and does not reach any further
- * into the ring than the erase could have. */
-static constexpr float GAS_NEEDLE_WEDGE_DEG = 6.0f;
-
-static float gasAngleDeg(int pct) {
-    return GAS_A0 + (GAS_A1 - GAS_A0) * pct / 100.0f;
-}
-
-static int gasRound6(float deg) {
-    return (int)(deg / 6.0f + 0.5f) * 6;
-}
-
-static void drawGasTick(float deg, uint16_t color) {
-    float r = deg * 3.14159265f / 180.0f;
-    s_gasTft->drawLine(GAS_CX + (int16_t)(GAS_RIN * cosf(r)),
-                       GAS_CY + (int16_t)(GAS_RIN * sinf(r)),
-                       GAS_CX + (int16_t)(GAS_ROUT * cosf(r)),
-                       GAS_CY + (int16_t)(GAS_ROUT * sinf(r)), color);
-}
-
-static void drawGasNeedle(float deg, uint16_t color) {
-    float a = deg * 3.14159265f / 180.0f;
-    float c = cosf(a), s = sinf(a);
-    float px = s, py = -c;                     // perpendicular to needle direction
-    int16_t bx0 = GAS_CX + (int16_t)(GAS_NEEDLE_W * px);
-    int16_t by0 = GAS_CY + (int16_t)(GAS_NEEDLE_W * py);
-    int16_t bx1 = GAS_CX - (int16_t)(GAS_NEEDLE_W * px);
-    int16_t by1 = GAS_CY - (int16_t)(GAS_NEEDLE_W * py);
-    int16_t tx = GAS_CX + (int16_t)(GAS_NEEDLE_R * c);
-    int16_t ty = GAS_CY + (int16_t)(GAS_NEEDLE_R * s);
-    s_gasTft->fillTriangle(bx0, by0, bx1, by1, tx, ty, color);
-}
-
-static char s_lastGasMv[12] = "";
-static char s_lastGasPct[8] = "";
-static uint16_t s_lastPctColor = 0xFFFF;
-// Last-drawn float-history band (LO%/HI% of the tank log), -2 = nothing drawn.
-// File scope, not a local of updateGasDisplay(), so drawGasFrame() can clear it:
-// the tracker is delta-based and must be invalidated whenever the panel is
-// filled, or the band is gone until the lifetime min/max next moves.
-static int16_t s_bandMin = -2, s_bandMax = -2;
-static char s_lastGasLow[10] = "";
-static uint16_t s_lastLowColor = 0xFFFF;
-static char s_lastGasLo[8] = "";
-static char s_lastGasHi[8] = "";
-static char s_lastGasLoMv[8] = "";
-static char s_lastGasHiMv[8] = "";
-static bool  s_needleDrawn = false;
-static float s_needleDeg = 0.0f;
-static int   s_gasDisp = -1;
-static bool  s_lowWas = false;
-static bool  s_blinkPhase = false;
-
-static void drawGasValue(int16_t x, int16_t y, uint8_t size, uint16_t color,
-                         uint16_t clearW, char* last, const char* s) {
-    if (strcmp(last, s) == 0) return;
-    strcpy(last, s);
-    s_gasTft->fillRect(x, y - 2, clearW, size * 8 + 4, GC9A01A_BLACK);
-    s_gasTft->setCursor(x, y);
-    s_gasTft->setTextSize(size);
-    s_gasTft->setTextColor(color);
-    s_gasTft->print(s);
-}
-
-static void drawGasText(int16_t x, int16_t y, uint8_t size, uint16_t clearW,
-                        uint16_t color, char* last, uint16_t* lastColor, const char* s) {
-    if (strcmp(last, s) == 0 && (lastColor == nullptr || *lastColor == color)) return;
-    strcpy(last, s);
-    if (lastColor != nullptr) *lastColor = color;
-    s_gasTft->fillRect(x, y - 2, clearW, size * 8 + 4, GC9A01A_BLACK);
-    s_gasTft->setCursor(x, y);
-    s_gasTft->setTextSize(size);
-    s_gasTft->setTextColor(color);
-    s_gasTft->print(s);
-}
-
-static void drawGasMajorTick(float deg) {
-    float r = deg * 3.14159265f / 180.0f;
-    s_gasTft->drawLine(GAS_CX + (int16_t)(86.0f * cosf(r)),
-                       GAS_CY + (int16_t)(86.0f * sinf(r)),
-                       GAS_CX + (int16_t)(110.0f * cosf(r)),
-                       GAS_CY + (int16_t)(110.0f * sinf(r)), GC9A01A_WHITE);
-}
-
-static void drawGasMarks() {
-    const int marks[3] = {25, 50, 75};
-    const char* labels[3] = {"1/4", "1/2", "3/4"};
-    for (int i = 0; i < 3; i++) {
-        float a = gasAngleDeg(marks[i]) * 3.14159265f / 180.0f;
-        const char* s = labels[i];
-        int w = (int)strlen(s) * 6;
-        s_gasTft->setTextSize(1);
-        s_gasTft->setTextColor(GC9A01A_DARKGREY);
-        s_gasTft->setCursor(GAS_CX + (int16_t)(70.0f * cosf(a)) - w / 2,
-                            GAS_CY + (int16_t)(70.0f * sinf(a)) - 4);
-        s_gasTft->print(s);
-    }
-}
-
-/* Repaint the tick ring between two angles, in the one z-order it has.
- *
- * Three layers, bottom to top: the 6 deg scale ticks, the yellow float-history
- * band, the white 25/50/75 majors. Everything that erases ring pixels has to put
- * them back through THIS function and nothing else, or they do not come back: the
- * ring is a delta-tracked region and nothing redraws it wholesale except
- * drawGasFrame()'s fillScreen().
- *
- * The majors are ABOVE the band, deliberately. drawGasMajorTick spans r=86..110
- * and the band r=92..108, so they overlap from 92 to 108, and the band used to be
- * drawn last - it won there, and the 1/2 mark survived only as two 6 px stubs
- * above and below the yellow. It never healed, because the majors were repainted
- * before the band on every pass. The majors are the reference the band is read
- * against, so they have to be legible through it; the band is a translucent-looking
- * overlay in the reader's eye, and losing the reference mark to show more of the
- * overlay is the wrong trade. The band still covers the ordinary scale ticks,
- * which is correct - they are texture, not reference.
- *
- * `bandLoPct`/`bandHiPct` are the band to DRAW, not the band being erased. A
- * caller whose band is changing passes the union of the old and new band as the
- * angular range and only the NEW band as these, so the part of the band that is
- * departing gets the scale and the majors repainted over it. Pass bandLoPct < 0
- * to draw no band at all.
- *
- * Clamped to the arc: the needle wedge at either end of the scale overhangs it
- * by 6 deg, and a phantom tick outside the arc would be plainly visible. */
-static void drawGasRing(float fromDeg, float toDeg, int bandLoPct, int bandHiPct) {
-    if (fromDeg < GAS_A0) fromDeg = GAS_A0;
-    if (toDeg   > GAS_A1) toDeg   = GAS_A1;
-    if (toDeg < fromDeg) return;
-    // Scale ticks: the 6 deg grid, starting at the first whole step at or after
-    // fromDeg. (A tick drawn a fraction of a degree outside the wedge would be
-    // harmless - same colour, already there - but not worth relying on.)
-    int a0 = gasRound6(fromDeg);
-    if ((float)a0 < fromDeg) a0 += 6;
-    for (int a = a0; a <= toDeg; a += 6) drawGasTick((float)a, GC9A01A_DARKGREY);
-    // The band walks its own grid: a step of 2% is 4.8 deg, deliberately not a
-    // multiple of the 6 deg scale step, so gasRound6() must NOT be used to place
-    // it. That mismatch is what the needle-erase repaint used to get wrong - it
-    // restored the scale on the 6 deg grid and left the band with a hole.
-    if (bandLoPct >= 0) {
-        for (int p = bandLoPct; p <= bandHiPct; p += 2) {
-            float d = gasAngleDeg(p);
-            if (d >= fromDeg && d <= toDeg) drawGasTick(d, GC9A01A_YELLOW);
-        }
-    }
-    // Majors last, so they read through the band. See the note above.
-    for (int p = 0; p <= 100; p += 25) {
-        float d = gasAngleDeg(p);
-        if (d >= fromDeg && d <= toDeg) drawGasMajorTick(d);
-    }
-}
-
-/* STRIPPED 2026-10-09 — NUMBER ONLY, at the owner's request.
- *
- * This used to draw the full gauge: bezel circles, the tick ring, the major
- * ticks, the 1/4 1/2 3/4 labels, the E/F ends, "GAS", the yellow float-history
- * band and a moving red needle. All of it is gone.
- *
- * WHY, and this is the diagnosis not a guess: the idle panel has been clean
- * through the whole investigation while the gas panel garbled - on the bench,
- * off the car, before and after the CS/DC pin swap, and with new caps and a new
- * ground wire. Wiring and pin assignment are therefore both excluded. What
- * separates the two panels is DRAW VOLUME: updateDisplay() is delta-gated and
- * only touches pixels when a value actually changes, while updateGasDisplay()
- * repainted a radial wedge (drawGasRing + drawGasMarks + needle) every 100 ms
- * for as long as the level was moving. That is a full-frame-class operation
- * over SOFTWARE SPI, which is bit-banged one bit at a time and has no clock
- * control at all.
- *
- * A number is the cheapest possible thing to draw: one fillRect plus a handful
- * of glyphs, and only when the digits actually change. If the panel is still
- * garbling with this on it, the fault is not in the draw path.
- *
- * What was removed and what still runs:
- *   - s_gasDisp / gasAngleDeg / drawGasNeedle / drawGasRing / drawGasMarks /
- *     drawGasMajorTick / drawGasText / drawGasValue  -> the ring/band/needle
- *     helpers are unused by the current bar face. They are left in place, not
- *     deleted: the ring/band/needle helpers are ~150 lines and the band logic
- *     in updateGasDisplay() is the only consumer of s_bandMin/s_bandMax.
- *     Deleting them is a separate, larger change and should not ride along
- *     with a fault fix.
- *   - The float history (s_gasHist) still accumulates in NVS from the 20 Hz
- *     sampler. It is simply not displayed. Nothing is lost by re-adding it.
- *
- * The face went through four versions on 2026-10-09, and three were rejected
- * on the panel, not on paper:
- *   VERTICAL BAR   -> "look grey": a 200x240 px DARKGREY track is most of the
- *                     screen, reads as a block rather than a gauge.
- *   NUMBERS ONLY   -> the face that was verified clean (bezel ring, "GAS",
- *                     centred percentage, miles below).
- *   HORIZONTAL, number INSIDE the bar -> real bug: drawGasText() clears its
- *                     own background, punching a hole in the fill, and the
- *                     shrink repaint then erased the number permanently (see
- *                     the overlap rule in the HORIZONTAL BAR block below).
- * The current face is the horizontal bar with the text clear of it. */
-
-/* HORIZONTAL BAR, 2026-10-09. Sideways fill, left to right.
- *
- * Geometry. The panel is a 240x240 disc, so a full-width rect only fits inside
- * the mask in a band around y=120 and its corners shear off anywhere else.
- * 160 px wide at y 96..144 (48 px tall) is comfortably inside the circle across
- * that whole span: the chord at y=96 is ~207 px, at y=144 ~207 px, so 160 px
- * centred leaves ~23 px of margin each side at both edges of the band.
- *
- * Text placement, and the rule behind it: nothing may OVERLAP the bar. Any text
- * over it has to clear its own background, which punches a hole in the fill, and
- * when the level DROPS the vacated-track repaint runs over that same region and
- * erases the text permanently — drawGasText() has already stored the new string
- * and would early-return, so nothing brings it back. That bug was hit for real
- * on the vertical-bar build and cost one rewrite. So:
- *
- *   y  40..58   "GAS"     (size 2, clear 60..78... see the sizes below)
- *   y  96..144  BAR       (no text over it, ever)
- *   y 178..216  "63%"     (size 4)
- *   y 226..238  miles     (size 1)
- *
- * s_gasBarW is the fill width already painted; -1 forces the first paint. A
- * growing fillRect cannot undo itself, so a SHRINK repaints the vacated track to
- * its right, or every drop would leave a bright ghost. */
-static constexpr int16_t GAS_BAR_X = 40;
-static constexpr int16_t GAS_BAR_Y = 96;
-static constexpr int16_t GAS_BAR_W = 160;  // full scale = full tank
-static constexpr int16_t GAS_BAR_H = 48;
-
-static int s_gasBarW = -1;
-
-static void drawGasFrame() {
-    s_gasTft->fillScreen(GC9A01A_BLACK);
-
-    /* Empty track, once. No bezel ring: on a face built around a bar it just
-     * competes with it, and the disc edge is the frame. */
-    s_gasTft->fillRect(GAS_BAR_X, GAS_BAR_Y, GAS_BAR_W, GAS_BAR_H, GC9A01A_DARKGREY);
-
-    s_gasTft->setTextColor(GC9A01A_CYAN);
-    s_gasTft->setTextSize(2);
-    s_gasTft->setCursor(96, 40);
-    s_gasTft->print("GAS");
-
-    s_gasDisp = -1;
-    s_gasBarW = -1;              // force the first update to paint the fill
-    s_lowWas = false;
-    s_blinkPhase = false;
-    s_lastGasMv[0] = s_lastGasPct[0] = 0;
-    s_lastPctColor = 0xFFFF;
-    // The float-history band is not drawn on this face, so its delta tracker has
-    // nothing to describe. Force it to invalidate on the first update after any
-    // re-init, or a stale value would compare equal and the -2 sentinel would
-    // never be seen again. The history itself still accumulates in NVS.
-    s_bandMin = -2;
-    s_bandMax = -2;
-}
-
-/* The single-panel face: the percentage, the miles estimate, "GAS".
- *
- * Every 100 ms pass, and nothing more:
- *   - walk s_gasDisp toward the target by 2%/pass (kept, so the digits ease
- *     rather than snap - it costs nothing)
- *   - print the number and the miles ONLY when the strings differ
- *   - blink the number red at low fuel
- *
- * No bar, no ring repaints, no needle. For what that established, see the header
- * above drawGasFrame(). */
-static void updateGasDisplay() {
-    if (!g_cfg.tftEnable || s_gasTft == nullptr) return;
-    char buf[12];
-
-    int target = gasPctFromFilt();
-    bool low = target <= g_cfg.lowFuelPct;
-    bool phase = ((millis() / 500) & 1) == 0;
-
-    if (s_gasDisp < 0) s_gasDisp = target;
-    else if (s_gasDisp < target) s_gasDisp = s_gasDisp + 2 > target ? target : s_gasDisp + 2;
-    else if (s_gasDisp > target) s_gasDisp = s_gasDisp - 2 < target ? target : s_gasDisp - 2;
-
-    /* Bar fill, left-anchored: width w is the level, growing rightward. */
-    uint16_t barColor = low ? (phase ? GC9A01A_RED : GC9A01A_DARKGREY) : GC9A01A_CYAN;
-    int w = (int)((long)s_gasDisp * GAS_BAR_W / 100);
-    if (w != s_gasBarW) {
-        if (w < s_gasBarW) {
-            /* Level dropped: repaint the vacated track to the RIGHT of the new
-             * fill, or every drop leaves a bright ghost ahead of the bar. Width
-             * is always positive here, so at w==0 the whole track is restored. */
-            s_gasTft->fillRect(GAS_BAR_X + w, GAS_BAR_Y, s_gasBarW - w, GAS_BAR_H,
-                               GC9A01A_DARKGREY);
-        }
-        if (w > 0) {
-            s_gasTft->fillRect(GAS_BAR_X, GAS_BAR_Y, w, GAS_BAR_H, barColor);
-        }
-        s_gasBarW = w;
-    } else if (low) {
-        /* Low-fuel blink with a steady level: the fill has to follow the colour
-         * even though its width did not change. Guarded on w>0 or the blink would
-         * clear the bar at 0%. */
-        if (w > 0) s_gasTft->fillRect(GAS_BAR_X, GAS_BAR_Y, w, GAS_BAR_H, barColor);
-    }
-
-    int est = (int)((long)s_gasDisp * g_cfg.tankGalX10 * g_cfg.gasMpg / 1000);
-    snprintf(buf, sizeof buf, "~%d mi", est);
-    drawGasValue(92, 226, 1, GC9A01A_CYAN, 56, s_lastGasMv, buf);
-
-    /* "100%" at size 4 is 4 x 24 = 96 px, centred at x = 72. The clear must
-     * cover the widest in-spec string or a shorter one leaves an ink ghost (the
-     * old L7 defect), so 112 px. Vertical clear is 178..216, which clears the
-     * bar at 144 and the miles at 226 with no overlap on either side. */
-    snprintf(buf, sizeof buf, "%d%%", s_gasDisp);
-    uint16_t pctColor = low ? (phase ? GC9A01A_RED : GC9A01A_DARKGREY) : GC9A01A_CYAN;
-    drawGasText(72, 180, 4, 112, pctColor, s_lastGasPct, &s_lastPctColor, buf);
-
-    /* Low-fuel warning on the number itself, rather than on a bezel ring.
-     * The warning PATH is unchanged from the old ring version -- same
-     * gasPctFromFilt() against the same g_cfg.lowFuelPct. Since 2026-10-11 the
-     * scale is continuous (no more 0%/8.4% dead zone - the last segment
-     * interpolates 8%..0%), so a threshold of N fires when the reading is
-     * at or below an actual N%. No hidden inside-the-gap behavior anymore. */
-    s_lowWas = low;
-    s_blinkPhase = phase;
-}
-
 /* GAS PANEL DISABLED 2026-10-09, at the owner's decision. One round panel.
+ * (Historical: all display code was then REMOVED 2026-10-21. Kept for the diagnosis.)
  *
  * WHY, as measured rather than argued:
  *   - Both panels share SCLK15/MOSI16. Separate CS (17/18 vs 2/21) and separate
@@ -2088,212 +1736,6 @@ static void updateGasDisplay() {
  *
  * To bring the panel back, delete this constant and nothing else - the renderer,
  * the draw path and the re-init steps are all still in the file. */
-static constexpr bool GAS_TFT_ENABLED = true;
-
-static void initGasTft() {
-    if (!GAS_TFT_ENABLED) return;
-    if (!g_cfg.tftEnable) return;
-    if (s_gasTft == nullptr) {
-        // The surviving panel is the CS17/DC18 one, and it now shows GAS. The
-        // panel on GAS_CS2/DC21 is not driven at all.
-        s_gasTft = new Adafruit_GC9A01A(g_cfg.pin.tftCs, g_cfg.pin.tftDc,
-                                        GAS_MOSI, GAS_SCLK, -1);
-    }
-    s_gasTft->begin();
-    s_gasTft->setRotation(1);
-    /* No fillScreen(): drawGasFrame() begins with one. See initTft(). */
-    drawGasFrame();
-}
-
-static void teardownTft() {
-    if (s_tft) { delete s_tft; s_tft = nullptr; }
-    if (s_gasTft) { delete s_gasTft; s_gasTft = nullptr; }
-}
-
-/* IDLE RENDERER OFF 2026-10-09. The single surviving panel shows GAS, so there
- * is nothing left for this one to drive. It stays in the file because the RPM /
- * duty / CLT / mode face is the thing intended to move to the DASH, and porting
- * it there means porting this code, not rewriting it.
- *
- * Guarded here AND in the re-init state machine below. Both gates are needed:
- * setup() calls initTft() directly, the state machine does not, and a half-gated
- * pair is exactly the split-brain that puts a renderer on a panel nothing else
- * is using. */
-static constexpr bool IDLE_TFT_ENABLED = false;
-
-static void initTft() {
-    if (IDLE_TFT_ENABLED && g_cfg.tftEnable) {
-        if (s_tft == nullptr) {
-            s_tft = new Adafruit_GC9A01A(GAS_CS, GAS_DC, g_cfg.pin.tftMosi, g_cfg.pin.tftSclk, -1);
-        }
-        s_tft->begin();
-        s_tft->setRotation(1);   // content upright when screen mounted pins-right
-        /* No fillScreen() here: drawGaugeFrame() starts with one. Two fills back
-         * to back over SOFTWARE SPI cost ~180 ms each (Adafruit_SPITFT has no
-         * fast path unless connection == TFT_HARD_SPI, so every pixel is 16
-         * iterations x 3 digitalWrite() calls). Both displays use -1 for reset,
-         * so begin() is ~300 ms each on its own. Dropping one redundant fill
-         * saved ~180 ms of a 1.3 s stall. */
-        drawGaugeFrame();
-        s_lastDuty[0] = s_lastRpm[0] = s_lastTgt[0] = s_lastClt[0] = 0;
-        s_lastMode[0] = s_lastStat[0] = 0;
-    }
-}
-
-/* ---------------------------------------------------------------------------
- * Deferred, STEPPED TFT (re)initialisation.
- *
- * Measured cost of a full re-init: begin() is ~300 ms per display (both use
- * RST=-1, so there is no hardware reset to lean on) and the first fillScreen()
- * is ~180 ms (Adafruit_SPITFT has no fast path unless built TFT_HARD_SPI, so
- * every pixel is 16 iterations x 3 digitalWrite()). Two displays ~= 1 s of solid
- * blocking, in ONE uninterrupted stretch.
- *
- * That used to run inside handleCommand(), on the same loop() pass as
- * updateOutputs(). Two consequences, both real:
- *
- *  1. The fan and IAC were frozen for that whole second. Pin changes are a
- *     console operation, but the box is live while you type them.
- *  2. Worse, s_canFresh is only evaluated at the TOP of loop(). During the
- *     stall it is never recomputed, so the 500 ms failsafe could not trip at
- *     all — the actuators sat at their last-written values with the link
- *     already dead underneath them, and no amount of lost CAN would change it.
- *
- * So a re-init is now a small state machine advanced ONE step per loop(),
- * from a point after updateOutputs() has run. The most expensive single step is
- * begin() at ~300 ms, comfortably inside the 500 ms failsafe window, so cooling
- * and the link check are re-evaluated between every step.
- *
- * setup() still calls initTft()/initGasTft() directly: nothing is at risk
- * before the link is up, and a screen that is ready when the boot banner
- * prints is worth more than a few ms. */
-enum TftStep : uint8_t {
-    TFT_IDLE = 0,
-    TFT_STEP_TEARDOWN,
-    TFT_STEP_IDLE_ALLOC,
-    TFT_STEP_IDLE_BEGIN,
-    TFT_STEP_IDLE_FRAME,
-    TFT_STEP_GAS_ALLOC,
-    TFT_STEP_GAS_BEGIN,
-    TFT_STEP_GAS_FRAME,
-};
-static TftStep s_tftStep = TFT_IDLE;
-static bool    s_tftReinitAgain = false;
-
-/* Ask for a re-init. Returns immediately; the work happens in loop().
- *
- * Requests that arrive while a sequence is in flight are LATCHED, not dropped.
- * The original version coalesced by simply ignoring them, which was wrong: the
- * steps read g_cfg.pin.tft* LAZILY, at their own alloc step, not here. So a
- * `P TFTC 13` landing at or after TFT_STEP_GAS_ALLOC changed the pin in NVS,
- * printed "pin map updated", and was then silently discarded — while the gas
- * display went on driving the OLD CS pin. Nothing re-queued it, the sequence ran
- * to TFT_IDLE, and the state looked settled.
- *
- * Reachable over the 0xC0 path: the queue is 6 deep and now drains one command
- * per pass, so a burst of pin commands is consumed across ~1.8 s of sequence and
- * any of them landing past its own alloc step was lost. The 0xD0 ack still said
- * the command succeeded.
- *
- * Latching instead re-runs the whole sequence from teardown on completion, so
- * the final state always matches the config that is actually stored. */
-static void tftReinitRequest() {
-    if (s_tftStep == TFT_IDLE) s_tftStep = TFT_STEP_TEARDOWN;
-    else                        s_tftReinitAgain = true;
-}
-
-static void tftIdleAlloc() {
-    if (s_tft == nullptr) {
-        // Reverted 2026-10-09: idle renderer on the configurable pair (CS17/DC18),
-        // gas renderer on GAS_CS2/DC21. Must match initTft()/initGasTft()
-        // exactly or a re-init lands the renderers on the wrong panels.
-        s_tft = new Adafruit_GC9A01A(g_cfg.pin.tftCs, g_cfg.pin.tftDc, g_cfg.pin.tftMosi, g_cfg.pin.tftSclk, -1);
-    }
-}
-static void tftGasAlloc() {
-    if (s_gasTft == nullptr) {
-        s_gasTft = new Adafruit_GC9A01A(GAS_CS, GAS_DC, GAS_MOSI, GAS_SCLK, -1);
-    }
-}
-
-/* One step per call. Deliberately NOT called from handleCommand(). */
-/* Terminal transition for the re-init state machine. Re-arms from teardown if a
- * request landed while the sequence was in flight, so the final state always
- * matches the config that is actually stored. All paths that end the sequence
- * must go through here rather than assigning TFT_IDLE directly. */
-static void tftReinitDone() {
-    if (s_tftReinitAgain) {
-        s_tftReinitAgain = false;
-        s_tftStep = TFT_STEP_TEARDOWN;
-        Serial.println("tft re-init: restart (config changed mid-sequence)");
-    } else {
-        s_tftStep = TFT_IDLE;
-    }
-}
-
-static void tftReinitStep() {
-    /* Re-check tftEnable on EVERY step, not just at teardown. The steps run one
-     * per loop() pass, so `P TFT 0` typed during the gas half used to leave the
-     * remaining steps initialising a display that had just been switched off —
-     * initTft()/initGasTft() both guard on tftEnable, so the state machine has
-     * to as well or it quietly diverges from them. */
-    if (s_tftStep != TFT_IDLE && s_tftStep != TFT_STEP_TEARDOWN && !g_cfg.tftEnable) {
-        teardownTft();
-        tftReinitDone();
-        Serial.println("tft re-init cancelled (tft disabled mid-sequence)");
-        return;
-    }
-    switch (s_tftStep) {
-        case TFT_IDLE: return;                       // nothing pending
-        case TFT_STEP_TEARDOWN:
-            teardownTft();
-            if (g_cfg.tftEnable) s_tftStep = TFT_STEP_IDLE_ALLOC;
-            // Must go through tftReinitDone() even on the disabled path: a request
-            // latched during the teardown step itself (e.g. `P TFT 0` arriving on
-            // the pass after `P TFTC 13`) is still set here, and assigning
-            // TFT_IDLE directly stranded it. The next unrelated re-init would then
-            // run the full ~1 s sequence twice and print "config changed
-            // mid-sequence" when nothing had. Self-healing, but wrong.
-            else                 tftReinitDone();
-            return;
-        case TFT_STEP_IDLE_ALLOC:                    // new(): ~0 ms, no SPI
-            /* Skipped when the idle renderer is off (see IDLE_TFT_ENABLED).
-             * Stepping through begin()/drawGaugeFrame() for a panel nobody is
-             * using costs ~480 ms of blocking for nothing, and s_tft would be
-             * left allocated on a panel that must stay untouched. */
-            if (!IDLE_TFT_ENABLED) { s_tftStep = TFT_STEP_GAS_ALLOC; return; }
-            tftIdleAlloc();
-            s_tftStep = TFT_STEP_IDLE_BEGIN;
-            return;
-        case TFT_STEP_IDLE_BEGIN:                    // ~300 ms — the worst step
-            if (!s_tft) { tftReinitDone(); Serial.println("tft re-init aborted: idle display alloc failed"); return; }
-            s_tft->begin();
-            s_tft->setRotation(1);
-            s_tftStep = TFT_STEP_IDLE_FRAME;
-            return;
-        case TFT_STEP_IDLE_FRAME:                    // ~180 ms
-            drawGaugeFrame();
-            s_lastDuty[0] = s_lastRpm[0] = s_lastTgt[0] = s_lastClt[0] = 0;
-            s_lastMode[0] = s_lastStat[0] = 0;
-            s_tftStep = TFT_STEP_GAS_ALLOC;
-            return;
-        case TFT_STEP_GAS_ALLOC:
-            tftGasAlloc();
-            s_tftStep = TFT_STEP_GAS_BEGIN;
-            return;
-        case TFT_STEP_GAS_BEGIN:                     // ~300 ms
-            if (!s_gasTft) { tftReinitDone(); Serial.println("tft re-init aborted: gas display alloc failed"); return; }
-            s_gasTft->begin();
-            s_gasTft->setRotation(1);
-            s_tftStep = TFT_STEP_GAS_FRAME;
-            return;
-        case TFT_STEP_GAS_FRAME:                     // ~180 ms
-            drawGasFrame();
-            tftReinitDone();
-            if (s_tftStep == TFT_IDLE) Serial.println("tft re-init complete");
-            return;
-    }
-}
 
 /* Persist g_cfg, but ONLY if it differs from what is already stored.
  *
@@ -2379,6 +1821,32 @@ static void loadCfg() {
     s_cfgShadowValid = true;
 }
 
+/* ---- Reset-reason logging (brownout / watchdog / panic / etc.) ----
+ *
+ * esp_reset_reason() is valid on the first read after boot and returns the
+ * cause of the most recent reset. We capture it early in setup(), store it in
+ * NVS (so it survives reboots), and expose it via the boot banner, the `?`
+ * report, and byte 19 of the 0xB0 frame (so the dash can display it without
+ * a serial cable).
+ *
+ * Counters: unexpected resets (brownout/panic/watchdog) + brownout resets. Clear with bare `Z`. */
+static const char* resetReasonName(esp_reset_reason_t r) {
+    switch (r) {
+        case ESP_RST_UNKNOWN:    return "UNKNOWN";
+        case ESP_RST_POWERON:    return "POWERON";
+        case ESP_RST_EXT:        return "EXT";
+        case ESP_RST_SW:         return "SW";
+        case ESP_RST_PANIC:      return "PANIC";
+        case ESP_RST_INT_WDT:    return "INT_WDT";
+        case ESP_RST_TASK_WDT:   return "TASK_WDT";
+        case ESP_RST_WDT:        return "WDT";
+        case ESP_RST_DEEPSLEEP:  return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT:   return "BROWNOUT";
+        case ESP_RST_SDIO:       return "SDIO";
+        default:                 return "?";
+    }
+}
+
 static void reportStatus() {
     Serial.printf("link=espnow rx_a0=%lu rx_c0=%lu tx_b0=%lu dropped=%lu can_fresh=%d rpm=%lu map=%.1f mat=%.1fF clt=%.1fF tps=%.1f%% batt=%.1fV afr=%.1f buz=%d\n",
                   (unsigned long)s_rxA0Count, (unsigned long)s_rxC0Count, (unsigned long)s_txB0Count,
@@ -2407,16 +1875,31 @@ static void reportStatus() {
     for (uint8_t i = 0; i < 7; i++) Serial.printf(" o%u=%d", i + 1, digitalRead(g_cfg.pin.out[i]) ? 1 : 0);
     Serial.println();
     for (uint8_t i = 0; i < 4; i++) {
-        Serial.printf("%s a%u=%.2fV%c(%s)%s%s", s_anForce[i] >= 0 ? "*" : "", i + 1,
-                      readAnalogMv(i) / 1000.0f,
-                      s_anLow[i] ? 'L' : 'H', tgtName(g_cfg.anOut[i]),
-                      g_cfg.anEnable[i] ? "" : " dis",
-                      s_anLatch[i] ? " LAT" : "");
+        if (kAnOpto[i]) {
+            /* PC817 digital input: there is no ADC value to print. Printing a
+             * voltage here would be a lie the operator could act on - a dead
+             * opto and a working one would both show a number. Print the pin
+             * level instead: LOW = signal present (optos are active-low). */
+            Serial.printf("%s a%u=%s(%s)%s%s", s_anForce[i] >= 0 ? "*" : "", i + 1,
+                          digitalRead(ADC_PINS[i]) == LOW ? "LOW" : "HIGH",
+                          tgtName(g_cfg.anOut[i]),
+                          g_cfg.anEnable[i] ? "" : " dis",
+                          s_anLatch[i] ? " LAT" : "");
+        } else {
+            Serial.printf("%s a%u=%.2fV%c(%s)%s%s", s_anForce[i] >= 0 ? "*" : "", i + 1,
+                          readAnalogMv(i) / 1000.0f,
+                          s_anLow[i] ? 'L' : 'H', tgtName(g_cfg.anOut[i]),
+                          g_cfg.anEnable[i] ? "" : " dis",
+                          s_anLatch[i] ? " LAT" : "");
+        }
     }
     Serial.printf("\nlat=%d%d%d%d\n",
                   s_anLatch[0] ? 1 : 0, s_anLatch[1] ? 1 : 0,
                   s_anLatch[2] ? 1 : 0, s_anLatch[3] ? 1 : 0);
     /* The 'eng=' report line is gone with the warning system. */
+    Serial.printf("RESETS: unexpected=%lu brownout=%lu last=%s\n",
+                  (unsigned long)s_resetCount, (unsigned long)s_brownoutCount,
+                  resetReasonName(s_lastResetReason));
 }
 
 /* True while a command came in over the unauthenticated ESP-NOW 0xC0 channel
@@ -2462,9 +1945,7 @@ static bool cmdAllowedFromLink(char key, const String& val) {
     switch (key) {
         // F A|1|0   fan auto / manual on / manual off
         // I F|A|<d> IAC follow MS / closed loop / manual duty
-        // I B <d>   IAC fail-safe duty (ECU link down, engine stopped). Legal
-        //            from the air like the rest of I: 0 is a valid value here
-        //            because this is the operator's own idle, not a kill.
+        // (I B <d> was removed: the IAC fail-safe duty is fixed at 35, see iacFailDuty.)
         // T <rpm>   closed-loop idle target
         case 'F':
         case 'I':
@@ -2519,6 +2000,16 @@ static void handleCommand(const String& line) {
     c.trim();
     if (c.length() == 0) return;
     if (c == "?") { reportStatus(); return; }
+    if (c == "Z") {
+        s_resetCount = 0;
+        s_brownoutCount = 0;
+        if (s_nvsOk) {
+            g_prefs.putUInt("rstcount", 0);
+            g_prefs.putUInt("bocount", 0);
+        }
+        Serial.println("reset counters cleared");
+        return;
+    }
 
     char key = c[0];
     String val = c.substring(1);
@@ -2673,6 +2164,20 @@ static void handleCommand(const String& line) {
             break;
         }
         case 'S': {
+            if (val == "P") {
+                Serial.printf("spulses2=%.2f\n", s_pulsesPerMph);
+                break;
+            }
+            if (val.startsWith("P ")) {
+                String a = val.substring(2); a.trim();
+                if (!argIsFloat(a)) { Serial.println("SP <pulses/mph>"); break; }
+                float p = a.toFloat();
+                if (!isfinite(p) || p <= 0.1f || p > 1000.0f) { Serial.println("SP <pulses/mph>"); break; }
+                s_pulsesPerMph = p;
+                if (s_nvsOk) g_prefs.putFloat("spulses2", s_pulsesPerMph);
+                Serial.printf("spulses2=%.2f\n", s_pulsesPerMph);
+                break;
+            }
             /* Validate the STRING, not the parsed result. String::toInt()
              * returns 0 for anything unparseable, so `S abc` and a bare `S`
              * both arrived as 0 and a `rpm > 0` test cannot tell a typo from
@@ -2956,7 +2461,7 @@ static void handleCommand(const String& line) {
                 /* Same two-part contract as the O arm, same order of checks.
                  *
                  * F means "the FAN output" - which is g_cfg.fanOut, not a literal
-                 * 7. It was hardcoded, so with the shipped fanOut of 6 (or any
+                 * 7. It was hardcoded, so with the old fanOut of 6 (or any
                  * `Y <k>`) the mapping pointed at a DIFFERENT pin than the one
                  * setFan() drives, while the confirmation line printed
                  *     a1 fan thr=12.0V HIGH(12V)
@@ -3079,7 +2584,7 @@ static void handleCommand(const String& line) {
                  * slot GAS_SEG = EMPTY). Every interior point is synthetic,
                  * derived by linear interpolation when an end is set. */
                 uint8_t slot = (val == "F") ? 0 : GAS_SEG;
-                uint16_t raw = readAnalogMv(3);
+                uint16_t raw = gasReadMv();   // same 13.0 V reference as the live reading
 
                 // Off-scale rejection (2026-09-20 stuck-at-full bug): an open
                 // sender reads ~60k (clamped to 60000), a dead short ~0.
@@ -3219,6 +2724,25 @@ static void handleCommand(const String& line) {
                 Serial.printf("tank=%.1f gal\n", g_cfg.tankGalX10 / 10.0f);
                 break;
             }
+            if (val == "V" || val.startsWith("V ")) {
+                if (val == "V") {
+                    Serial.printf("gasvcomp=%d battHold=%d.%dV\n", s_gasVcomp ? 1 : 0,
+                                  s_battHoldDeciV / 10, abs(s_battHoldDeciV % 10));
+                    break;
+                }
+                String a = val.substring(2); a.trim();
+                if (!argIsInt(a)) { Serial.println("vcomp 0|1"); break; }
+                int on = a.toInt();
+                if (on != 0 && on != 1) { Serial.println("vcomp 0|1"); break; }
+                if ((bool)on != s_gasVcomp) {
+                    s_gasVcomp = (bool)on;
+                    if (s_nvsOk) g_prefs.putUChar("gasvcomp", on ? 1 : 0);
+                    s_gasFilt = -1;
+                    gasSampleMv();
+                }
+                Serial.printf("gasvcomp=%d\n", s_gasVcomp ? 1 : 0);
+                break;
+            }
             Serial.printf("gas=%d%% mv=%d est=%dmi damp=%u warn<=%u%% mpg=%u tank=%.1fgal pts(%d,F..E)=",
                           gasPctFromFilt(), s_gasFilt,
                           (int)((long)gasPctFromFilt() * g_cfg.tankGalX10 * g_cfg.gasMpg / 1000),
@@ -3349,7 +2873,6 @@ static void handleCommand(const String& line) {
                 g_cfg.pin = PinMap{};
                 saveCfg();
                 applyPinConfig();
-                tftReinitRequest();
                 Serial.println("pin map reset to iobox3 defaults");
                 break;
             }
@@ -3414,7 +2937,6 @@ static void handleCommand(const String& line) {
                 // command or a reboot, because ledApply() is only called from
                 // ledInit() and the `L` handler. "Reboot not required" was a lie.
                 ledApply();
-                tftReinitRequest();
                 Serial.println("FACTORY RESET: cfg + gas table + gas history + peer filters + A1-A4 polarity");
                 Serial.println("              + LED bar + buzzer overrides, all back to defaults.");
                 if (s_nvsOk && wipeOk) {
@@ -3437,7 +2959,6 @@ static void handleCommand(const String& line) {
             if (val == "TFT 1" || val == "TFT 0") {
                 g_cfg.tftEnable = (val == "TFT 1");
                 saveCfg();
-                tftReinitRequest();
                 Serial.println(g_cfg.tftEnable ? "tft on (re-init queued)" : "tft off (re-init queued)");
                 break;
             }
@@ -3481,10 +3002,6 @@ static void handleCommand(const String& line) {
                  * wrong field here fails closed (see pinAliasFree()). */
                 uint8_t asg = PINASSIGN_NONE;
                 if      (k == "BZ")   asg = PINASSIGN_BZ;
-                else if (k == "TFTS") asg = PINASSIGN_TFTS;
-                else if (k == "TFTM") asg = PINASSIGN_TFTM;
-                else if (k == "TFTC") asg = PINASSIGN_TFTC;
-                else if (k == "TFTD") asg = PINASSIGN_TFTD;
                 if (!pinAliasFree((uint8_t)pin, -1, asg)) {
                     Serial.println("pin rejected: already used by an output/IAC/buzzer/LED/speed/gas/display pin");
                     break;
@@ -3542,7 +3059,6 @@ static void handleCommand(const String& line) {
             }
             saveCfg();
             applyPinConfig();
-            tftReinitRequest();
             Serial.println("pin map updated (tft re-init queued)");
             break;
         }
@@ -3771,10 +3287,6 @@ static bool pinAliasFree(uint8_t p, int skip_idx, uint8_t assigning) {
      * self-assignment gets refused, which costs a no-op, and never opens a
      * collision. A new display pin added to PinMap later must be added here in
      * the same commit; this is the only place that knows the display's pins. */
-    if (p == g_cfg.pin.tftSclk && assigning != PINASSIGN_TFTS) return false;
-    if (p == g_cfg.pin.tftMosi && assigning != PINASSIGN_TFTM) return false;
-    if (p == g_cfg.pin.tftCs   && assigning != PINASSIGN_TFTC) return false;
-    if (p == g_cfg.pin.tftDc   && assigning != PINASSIGN_TFTD) return false;
     if (p == g_cfg.pin.ledData) return false;
     if (p == PIN_SPEED || p == GAS_SCLK || p == GAS_MOSI || p == GAS_CS || p == GAS_DC) return false;
     for (int i = 0; i < 7; i++) {
@@ -3867,6 +3379,10 @@ void setup() {
     delay(200);
 
     /* ---- Loop watchdog -------------------------------------------------
+     *
+     * NOTE 2026-10-21: the display code is gone, so the 365 ms display block and the
+     * 300 ms re-init step in the itemisation below no longer exist. The worst pass is
+     * now ~0.5 s, which only widens the margin against the 15 s timeout.
      *
      * There was NO watchdog of any kind before this. The TWDT was never
      * initialised: arduino-esp32's loopTask() calls esp_task_wdt_reset() but
@@ -3987,6 +3503,14 @@ void setup() {
         Serial.println("      Running on defaults. All changes this session will be LOST.");
         Serial.println("      Check free flash and that the NVS partition exists.");
     }
+    // ---- Reset-reason capture (RAM only here) ----
+    // esp_reset_reason() is valid on the first read after boot. NVS counters are
+    // updated further down, AFTER applyPinConfig(): a flash write before it would
+    // lengthen the window in which the actuator pins float, and a flash erase is
+    // a current spike on a rail that may already be marginal.
+    s_lastResetReason = esp_reset_reason();
+    Serial.printf("RESET REASON: %s\n", resetReasonName(s_lastResetReason));
+
     loadCfg();
 
     /* Drive the actuator pads NOW, immediately after the pin map is known and
@@ -4009,6 +3533,29 @@ void setup() {
      * A 10k pulldown to GND on that pin is the fix for the remainder. */
     applyPinConfig();
 
+    /* Fault counters, now that the outputs are parked. Only UNEXPECTED resets
+     * (brownout / panic / any watchdog) are counted and written; a normal key-on
+     * (POWERON) or a software/USB reset writes nothing, so a clean boot costs no
+     * flash write. A brownout deep enough to drop below the power-on-reset
+     * threshold reads as POWERON, so brownouts=0 does not prove the rail is clean. */
+    if (s_nvsOk) {
+        s_resetCount    = g_prefs.getUInt("rstcount", 0);
+        s_brownoutCount = g_prefs.getUInt("bocount", 0);
+        const bool unexpected =
+            s_lastResetReason == ESP_RST_BROWNOUT || s_lastResetReason == ESP_RST_PANIC ||
+            s_lastResetReason == ESP_RST_INT_WDT  || s_lastResetReason == ESP_RST_TASK_WDT ||
+            s_lastResetReason == ESP_RST_WDT;
+        if (unexpected) {
+            s_resetCount++;
+            if (s_lastResetReason == ESP_RST_BROWNOUT) s_brownoutCount++;
+            g_prefs.putUChar("rstreason", (uint8_t)s_lastResetReason);
+            g_prefs.putUInt("rstcount", s_resetCount);
+            g_prefs.putUInt("bocount", s_brownoutCount);
+        }
+    }
+    Serial.printf("FAULT RESETS: unexpected=%lu brownout=%lu\n",
+                  (unsigned long)s_resetCount, (unsigned long)s_brownoutCount);
+
     gasHistoryLoad();
     // Re-score the log's percentages against the table that was actually loaded.
     // Normally a no-op (they were scored against this same table when written),
@@ -4021,15 +3568,17 @@ void setup() {
     loadDashMac();
     loadDiagMac();
     loadAnPol();
+    if (s_nvsOk) s_gasVcomp = g_prefs.getUChar("gasvcomp", 1) != 0;
+    if (s_nvsOk) {
+        float v = g_prefs.getFloat("spulses2", 1.5f);
+        if (v > 0.1f && v < 1000.0f) s_pulsesPerMph = v;
+    }
 
     // 0xC0 command queue: espnowRecv only enqueues; loop() drains+executes.
     s_cmdQ = xQueueCreate(CMD_Q_SLOTS, CMD_Q_LEN);
 
     // Pins are already applied immediately after loadCfg() above — deliberately,
     // so the outputs are not floating across the NVS loads.
-
-    initTft();
-    initGasTft();
 
     for (uint8_t i = 0; i < 4; i++) {
         pinMode(ADC_PINS[i], INPUT);
@@ -4090,28 +3639,6 @@ void loop() {
         speedTick(elapsed);
         espnowSendStatus();
     }
-
-    static uint32_t tftLast = 0;
-    // Skip the 10 Hz redraw while a re-init is in flight. Between alloc and
-    // begin() the object exists but the panel is unconfigured, and drawValue()
-    // would happily issue drawPixel()s into it — slow at best. updateDisplay()
-    // already guards on s_tft == nullptr, which covers the post-teardown window
-    // but NOT this one.
-    if (g_cfg.tftEnable && now - tftLast >= 100 && s_tftStep == TFT_IDLE) {
-        tftLast = now;
-        /* Both renderers are gated here as well as at init. updateDisplay() only
-         * checks s_tft != nullptr and would keep drawing into a panel the idle
-         * renderer is no longer allowed to own. */
-        if (IDLE_TFT_ENABLED) updateDisplay();
-        if (GAS_TFT_ENABLED)  updateGasDisplay();
-    }
-
-    // Advance a queued TFT re-init by ONE step. Placed AFTER updateOutputs() so
-    // the actuators have already been written with this tick's data, and one
-    // step per pass so the worst single block (begin(), ~300 ms) stays well
-    // inside the 500 ms failsafe window. See tftReinitStep() for why this was
-    // worth splitting at all.
-    tftReinitStep();
 
     static uint32_t gasHistLast = 0;
     if (now - gasHistLast >= 100) {
