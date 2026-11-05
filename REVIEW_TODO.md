@@ -28,12 +28,14 @@ Status: **nothing applied.** This file is a proposal. Verify with `git status` /
    threshold at all; the fix is hardware.**
 3. **Real hardware has no undo (AGENTS `:667`); no in-car key presses
    (AGENTS `:40`).** Every flash/verify step in this list is **parked only**.
-4. **AGENTS.md's gas section is STALE.** `:151-210` still describes the
-   *3228…24109* 13-anchor table as "on the box". `main.cpp:261-277` (2026-10-08)
-   supersedes it: EMPTY was re-derived to **19967**, and the car's **stored table
-   is degenerate** (9 of 13, last four zeroed) so the gauge falls back to
-   `kGasStockMv` = `3228…19967`. → Items **2/4** below are consistent with the
-   *source*, not with the stale doc. Fix the doc.
+4. **AGENTS.md's gas section WAS STALE — FIXED 2026-10-18.** It described the
+   *3228…24109* 13-anchor table as "on the box". The live table is `kGasStockMv`
+   = **`3228…18000`** (EMPTY re-derived `24109 → 19967 → 18000`, last change
+   2026-10-11 / commit `7aa9d21`), and the car's **stored table is degenerate**
+   (9 of 13, last four zeroed) so the gauge runs the fallback. AGENTS.md now carries
+   a **CURRENT TABLE** block; `microsquirt_iobox_dash.md`,
+   `gas_empty_baseline_2026-10-08.md` and `INDEX.md` were reconciled too.
+   → Items **2/4/7** below now use **18000**, not 19967.
 
 ---
 
@@ -77,12 +79,12 @@ Status: **nothing applied.** This file is a proposal. Verify with `git status` /
 - The source states the consequence at `273-277`: the box printed *"anchors
   off-scale/degenerate -> mapping STOCK span"* and the gauge ran on
   `kGasStockMv`. So the compiled default is what actually decides the needle.
-- **Fix** (same values as `kGasStockMv`; `sizeof(Cfg)` unchanged → existing blob
-  still accepted):
+- **Fix** (copy `kGasStockMv` verbatim, `main.cpp:280`; `sizeof(Cfg)` unchanged →
+  existing blob still accepted):
   ```cpp
   uint16_t gasCalMv[GAS_ANCHORS] = {
-      3228, 4623, 6018, 7413, 8808, 10203, 11598,
-      12992, 14387, 15782, 17177, 18572, 19967
+      3228, 4459, 5690, 6921, 8152, 9383, 10614,
+      11845, 13076, 14307, 15538, 16769, 18000
   };
   ```
 - **`Q R` is safe here**: `3042` does `memcpy(g_cfg.gasCalMv, kGasStockMv, …)`, so
@@ -93,7 +95,7 @@ Status: **nothing applied.** This file is a proposal. Verify with `git status` /
 - **Do NOT re-record anchors after** — AGENTS `:135`/`:153`. `Q R` restores the
   default; it is not a re-calibration.
 - Update the `"12.5% per segment"` comment at `340` → 13 anchors = 12 segments =
-  **8.33%** (span 3228…19967, 1394.9 mV/segment).
+  **8.33%** (span 3228…18000, 1231 mV/segment).
 
 ### [ ] 3. `Q 1/2/3` write the wrong slots (real bug)
 - `main.cpp:3080`: `slot = (d <= 3) ? (GAS_SEG - 2*d) : d`. At `GAS_SEG=12` that
@@ -113,8 +115,10 @@ Status: **nothing applied.** This file is a proposal. Verify with `git status` /
 - `3075-3081` + the digit gate `val[0] >= '1' && <= '9'` (`3058`). After item 3,
   reachable = {3,4,5,6,7,8,9}; `Q F`=0, `Q E`=12. Slots **1, 2, 10, 11, 12** are
   unreachable.
-- Slot **11** matters: it is `c[GAS_SEG-1]`, the **0% cliff** (`main.cpp:269-271`,
-  `1552`). It can only be reached via `Q F`/`Q E` re-linearisation or `Q R`.
+- Slot **11** was `c[GAS_SEG-1]`, the **0% cliff** — **that cut was removed
+  2026-10-11** (`7aa9d21`), so slot 11 is now an ordinary interior anchor. Slots
+  **1, 2, 10, 11, 12** are still reachable only via `Q F`/`Q E` re-linearisation or
+  `Q R`.
 - Comment `3069-3074` acknowledges "anything above is unreachable" yet still
   says `8/9/0` cover slots 10/11/12 — `0` is rejected by the digit gate.
 - **Decide** the intended mapping (extend the digit range to accept `Q0` and/or map
@@ -143,19 +147,18 @@ Status: **nothing applied.** This file is a proposal. Verify with `git status` /
 ## APPLY — behaviour
 
 ### [ ] 7. Low-fuel buzzer chirps forever with the sender unplugged
-- `1367` has no sender-sanity gate. An unplugged sender rails the node
-  (`gasSampleMv`, `1486-1490`: open → ~75k reported → clamped to 32000) → 0% →
+- `1376` has no sender-sanity gate. An unplugged sender rails the node
+  (`gasSampleMv`, `1490-1499`: open → ~75k reported → clamped to 32000) → 0% →
   continuous chirp. Logged in `ms_iobox_dash_bug_report.md` L2.
-- AGENTS `:19` (wrong-claim #12): the sender range is **3228…24109** and *never
-  0*; current source says 3228…19967. Either way, 32000 only ever means "unplugged
-  / railed".
+- The sender range is **3228…18000** (EMPTY was 24109, then 19967) and *never 0*;
+  32000 only ever means "unplugged / railed".
 - **Fix in `updateBuzzer()`:**
   ```cpp
   bool senderOk = s_gasFilt >= 0 && s_gasFilt < 30000;
   bool lowFuel  = senderOk && gasPctFromFilt() <= g_cfg.lowFuelPct;
   ```
-- A genuine empty (~19967) is < 30000, so the alarm still fires when it should.
-- The red blink in `updateGasDisplay` (`1999`) still shows 0% on the bench — out
+- A genuine empty (~18000) is < 30000, so the alarm still fires when it should.
+- The red blink in `updateGasDisplay` (`2008`) still shows 0% on the bench — out
   of scope if you only want the beeper silenced.
 
 ### [ ] 8. LED colour writes flash on every step
@@ -262,7 +265,9 @@ Status: **nothing applied.** This file is a proposal. Verify with `git status` /
   widen the window."*
 - AGENTS wrong-claim #24 (`:38`): *"Never use a code constant as ground truth
   about the hardware."* The 3228 figure is the **undriven floor** (`:864`), and
-  the whole analog front end is unresolved (`:147-149`).
+  the **A3** front end is unresolved. (A4's constant mismatch is **not** an open
+  item — it is a pure scale factor that cancels, closed by the owner 2026-10-18,
+  wrong-claim #33.)
 - **Sanctioned fix (hardware):** LM393 comparator on A3, same as the ABS speed
   input on GPIO5 (AGENTS `:875`). Secondary options: 100 kΩ pull-down on the car
   wire (then ON reads ~6,100 → threshold ~3,000; **both or neither**), or PC817
@@ -317,5 +322,7 @@ Status: **nothing applied.** This file is a proposal. Verify with `git status` /
 4. Then the next group (#2–#6) — but run `Q R` **once** and `Q` to confirm 13
    anchors; do **not** re-record anchors.
 5. Leave radio (#12/#13) for its own flash so a link break is unambiguous.
-6. Update the stale AGENTS.md gas section (`:151-210`) to the 19967 / degenerate-
-   stored-table reality.
+6. ~~Update the stale AGENTS.md gas section~~ — **DONE 2026-10-18.** It now carries the
+   `3228…18000` table, the removed cliff and the degenerate-stored-table reality (a **CURRENT
+   TABLE** block at the top of the gas section). `microsquirt_iobox_dash.md`,
+   `gas_empty_baseline_2026-10-08.md` and `INDEX.md` were reconciled in the same pass.

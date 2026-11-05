@@ -42,11 +42,17 @@ to GPIO 33 is accepted — including the free CAN-era pins 4 and 5.
 
 ### Analog front end
 
-All four channels: **100 kΩ series from the car wire → node → 4.6 kΩ to GND**
-(rework of 2026-08-22 after two boards were killed by a low-impedance bodge;
-worst-case pin voltage ~1.76 V even at 40 V load dump). `readAnalogMv()` reports
-**source millivolts**: node × (100k+4.6k)/4.6k ≈ ×22.74. A4 additionally caps at
-60000 mV so an unplugged sender reads EMPTY (safe direction), not wrapped-full.
+**A1–A3**: **100 kΩ series from the car wire → node → 4.6 kΩ to GND** (rework of
+2026-08-22 after two boards were killed by a low-impedance bodge; worst-case pin
+voltage ~1.76 V even at 40 V load dump). **A4 is different** — it is the **220 Ω
+front end** (owner-measured: 220 Ω between 3V3 and the node; topology written up in
+`how_to_md_files/iobox3_adc_frontend_versions.md`). `readAnalogMv()` reports
+**source millivolts** for every channel as node × (100k+4.6k)/4.6k ≈ ×22.74; for
+**A4 this is a reporting convention only** — the constant describes a 100 kΩ top
+leg that A4 does not have. It **cancels** in the gas mapping (the stored anchors
+were recorded through the same path), so it is harmless and must not be treated as
+a fault. A4 additionally caps at 60000 mV so an unplugged sender reads EMPTY (safe
+direction), not wrapped-full.
 
 
 ## ESP-NOW protocol
