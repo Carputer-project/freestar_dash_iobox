@@ -10,6 +10,8 @@
 // esp32-hal.h declares only the core helpers (enableLoopWDT et al).
 #include <esp_task_wdt.h>
 #include <esp_system.h>   // esp_reset_reason()
+#include "link_sec.h"
+#include "ota_relay.h"
 
 // Old CAN pins (GPIO4/5) are now FREE — the SN65HVD230 transceiver is gone.
 // PIN_LED retired: GPIO2 is owned by the gas-gauge TFT CS (GAS_CS below).
@@ -832,6 +834,14 @@ static void loadDashMac() {
     if (len == sizeof(buf)) memcpy(s_dashMac, buf, sizeof(buf));
 }
 static void saveDashMac() { g_prefs.putBytes("dashmac", s_dashMac, sizeof(s_dashMac)); }
+
+/* A completed pairing writes the dash MAC into the existing dashmac filter, so
+ * the two allow-lists can never disagree about who the dash is. */
+static void onLinkSecPaired(const uint8_t* mac) {
+    memcpy(s_dashMac, mac, 6);
+    saveDashMac();
+    Serial.println("linksec: dashmac filter now matches the paired dash");
+}
 static bool dashMacBound() {
     for (uint8_t i = 0; i < 6; i++) if (s_dashMac[i]) return true;
     return false;
@@ -860,10 +870,20 @@ static bool peerAllowed(const uint8_t* mac) {
 
 static void espnowRecv(const uint8_t* mac, const uint8_t* data, int len) {
     if (!data || len < 1) return;
-    if (!peerAllowed(mac)) {
+    /* Pairing frames first: they are answered here and never reach the decoders
+     * below. A frame from a MAC other than the paired dash is dropped outright,
+     * which is what makes an unpaired link the only open case. */
+    if (linkSecFrame(mac, data, len)) return;
+    /* Paired: only the paired dash (or the bench diag module, which is a MAC
+     * allow-list of its own) may speak. Unpaired: as before. */
+    if (!linkSecSrcOk(mac) && !peerAllowed(mac)) {
         s_rxDroppedCount++;              // not our dash/diag — ignore
         return;
     }
+    /* A firmware image from the paired dash. 0xD1/0xD2/0xD4 only stage state
+     * here - every flash call happens in loop(), because Update.write() blocks
+     * and this runs on the WiFi task. */
+    if (otaRelayFrame(data, len)) return;
     if (!dashMacBound() && !diagMacBound() && !s_dashMacHinted) {
         s_dashMacHinted = true;
         Serial.println("note: peer MAC filter unbound — pin it with P DASH/P DIAG <mac> (see ? )");
@@ -891,6 +911,19 @@ static void espnowRecv(const uint8_t* mac, const uint8_t* data, int len) {
             if (len < 2) break;
             s_rxC0Count++;
             uint8_t n = data[1] < (len - 2) ? data[1] : (uint8_t)(len - 2);
+            /* Replay counter: 4 LE bytes after the command text. Required once
+             * paired — the frame is encrypted then, but a captured ciphertext
+             * could still be replayed verbatim to switch the fan off. Not
+             * required while unpaired, so an un-paired box still accepts the
+             * pre-pairing dash. */
+            if (linkSecPaired()) {
+                if (len < 2 + n + 4) { s_rxDroppedCount++; break; }
+                uint32_t ctr = (uint32_t)data[2 + n]
+                             | ((uint32_t)data[3 + n] << 8)
+                             | ((uint32_t)data[4 + n] << 16)
+                             | ((uint32_t)data[5 + n] << 24);
+                if (!linkSecCmdOk(ctr)) { s_rxDroppedCount++; break; }
+            }
             if (n > CMD_Q_LEN - 1) n = CMD_Q_LEN - 1;
             char buf[CMD_Q_LEN];
             uint8_t j = 0;
@@ -968,10 +1001,11 @@ static void espnowSendStatus() {
     f[17] = g_cfg.buzzerEnable ? 1 : 0;
     f[18] = 0;  // warn mask HIGH — unused now; byte KEPT so f[19..] stay put
     f[19] = (uint8_t)s_lastResetReason;  // last reset cause (ESP_RST_*) for dash display
-    esp_err_t r = esp_now_send(ESP_NOW_BROADCAST, f, sizeof(f));
+    /* Unicast + encrypted once paired with the dash; broadcast before that. */
+    bool ok = linkSecSend(f, sizeof(f));
     s_txB0Count++;
-    if (r != ESP_OK) {
-        Serial.printf("espnow send B0 FAILED: %s\n", esp_err_to_name(r));
+    if (!ok) {
+        Serial.println("espnow send B0 FAILED");
     }
 }
 
@@ -1069,6 +1103,11 @@ static void espnowInit() {
     peer.ifidx = WIFI_IF_AP;
     peer.encrypt = false;
     esp_now_add_peer(&peer);
+    /* Join the link security layer: loads a stored key, registers the encrypted
+     * peer, and starts answering pairing windows. */
+    linkSecSetPairedCb(onLinkSecPaired);
+    linkSecBegin(LINK_ROLE_IOBOX);
+    otaRelayBegin(LINK_ROLE_IOBOX);
     Serial.println("ESP-NOW link up (ch1)");
 }
 
@@ -1855,6 +1894,7 @@ static void reportStatus() {
                   g_map / 10.0f, g_mat / 10.0f, g_clt / 10.0f,
                   g_tps / 10.0f, g_batt / 10.0f, g_afr / 10.0f,
                   g_cfg.buzzerEnable ? 1 : 0);
+    linkSecPrint(Serial);
     /* Anchors printed as a run, not five named slots: the table is GAS_ANCHORS
      * wide and a printf listing five of nine would silently under-report the
      * calibration. Index 0 = FULL, index GAS_SEG = EMPTY. */
@@ -2008,6 +2048,14 @@ static void handleCommand(const String& line) {
             g_prefs.putUInt("bocount", 0);
         }
         Serial.println("reset counters cleared");
+        return;
+    }
+
+    /* PAIRC: forget the paired dash and its key. UART only — a frame that can
+     * unpair the link is a denial of service once the link is the thing that
+     * runs the fan. */
+    if (!s_cmdFromLink && c.equalsIgnoreCase("PAIRC")) {
+        linkSecClear();
         return;
     }
 
@@ -3596,6 +3644,9 @@ void setup() {
 }
 
 void loop() {
+    /* First statement on purpose: a relayed image is written here, never in
+     * the ESP-NOW callback, and it must run even on a pass that blocks later. */
+    otaRelayTick();
     uint32_t lastFrm = s_lastFrameMs;
     s_canFresh = s_anyGroupSeen && (millis() - lastFrm) < FAILSAFE_MS;
     decodeOutpc();
@@ -3638,6 +3689,7 @@ void loop() {
         dashLast = now;
         speedTick(elapsed);
         espnowSendStatus();
+        linkSecTick();
     }
 
     static uint32_t gasHistLast = 0;
